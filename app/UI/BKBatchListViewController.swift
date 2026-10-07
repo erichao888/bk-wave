@@ -1,18 +1,24 @@
 //
 //  BKBatchListViewController.swift
-//  bk波剪 — 波剪页 ☰ 进来的「本批素材清单」
+//  bk波剪 — 导出页（本批素材清单 + 导出选项 + 开始导出）
 //
-//  【两个用途】
-//  ① 点某条 → 进该条的波剪页（替换 nav 栈为 [首页, 编辑器]，不无限堆叠）
-//  ② 勾选多条 → 底部「导出选中(N)」逐个导出并存入相册
+//  【为什么要合并（皓哥 2026-10-08 拍板）】
+//  以前「☰ 列表」和「导出面板」是两个入口，而且批量导出**根本选不了规格**（写死同源），
+//  单条反而能选 —— 两套行为对不上，导出面板很尴尬。合并成一屏：
+//    上部 = 本批素材清单（点行进编辑 / 圆圈勾选 / 红名=删过红区 / 原时长→剪后时长）
+//    中部 = 导出选项（分辨率 / 帧率，整批统一）+ 已选条数与合计时长
+//    底部 = 蓝色「开始导出 N 条」（未选时**仍为蓝色**，点了弹「未选择视频，无法导出」）
 //
-//  【文件名配色】删过红区（用户动过刀 / 已折叠）标红（BKTheme.Color.danger），
-//  没动过的用默认文字色 —— 一眼看出哪几条已经剪过。
+//  【两个入口怎么进来】
+//  · ☰            → 本批清单，默认不勾选
+//  · 波剪页「导出」→ 同一页，但**自动勾选当前这一条**（preselect）
+//
+//  【导出】逐条排队调用 BKExporter.export（Part 化），单条失败继续，末弹汇总。
+//  进度沿用 HUD 弹窗（第几条 + 总% + 本条%）。
 //
 
 import UIKit
 import AVFoundation
-import Photos
 
 final class BKBatchListViewController: UIViewController {
 
@@ -20,13 +26,21 @@ final class BKBatchListViewController: UIViewController {
     private var batch: BKBatch?
     private var selected = Set<Int>()
 
+    // MARK: - 界面
+
     private let tableView = UITableView(frame: .zero, style: .plain)
-    private let exportButton = UIBarButtonItem()
+    private let optionsCard = UIView()
+    private let resSeg = UISegmentedControl(items: BKConfig.Resolution.allCases.map { $0.rawValue })
+    private let fpsSeg = UISegmentedControl(items: BKConfig.FrameRate.allCases.map { $0.rawValue })
+    private let summaryLabel = UILabel()
+    private let exportButton = UIButton(type: .system)
     private let selectAllButton = UIBarButtonItem(title: "全选", style: .plain, target: nil, action: nil)
 
-    init(batchID: UUID) {
+    /// - Parameter preselect: 进来就勾上的序号（波剪页「导出」传当前条）
+    init(batchID: UUID, preselect: Int? = nil) {
         self.batchID = batchID
         super.init(nibName: nil, bundle: nil)
+        if let p = preselect { selected.insert(p) }
     }
 
     required init?(coder: NSCoder) { fatalError("bk波剪不走 storyboard") }
@@ -36,7 +50,7 @@ final class BKBatchListViewController: UIViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = BKTheme.Color.page
-        title = "本批素材"
+        title = "导出"
         setupUI()
         reload()
     }
@@ -44,11 +58,6 @@ final class BKBatchListViewController: UIViewController {
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         reload()
-    }
-
-    override func viewWillDisappear(_ animated: Bool) {
-        navigationController?.setToolbarHidden(true, animated: false)
-        super.viewWillDisappear(animated)
     }
 
     // MARK: - 布局
@@ -60,30 +69,93 @@ final class BKBatchListViewController: UIViewController {
         selectAllButton.action = #selector(selectAllTapped)
         navigationItem.rightBarButtonItem = selectAllButton
 
-        exportButton.title = "导出选中"
-        exportButton.target = self
-        exportButton.action = #selector(exportSelectedTapped)
-        exportButton.tintColor = BKTheme.Color.accent
-        exportButton.isEnabled = false
-        let spacer = UIBarButtonItem(barButtonSystemItem: .flexibleSpace, target: nil, action: nil)
-        setToolbarItems([spacer, exportButton, spacer], animated: false)
-        navigationController?.setToolbarHidden(false, animated: false)
-
+        // ---- 上部：素材清单 ----
         tableView.backgroundColor = BKTheme.Color.page
         tableView.separatorColor = BKTheme.Color.line
-        tableView.contentInset = UIEdgeInsets(top: 0, left: 0, bottom: 56, right: 0)
         tableView.register(BatchRowCell.self, forCellReuseIdentifier: BatchRowCell.reuseID)
         tableView.dataSource = self
         tableView.delegate = self
-        tableView.translatesAutoresizingMaskIntoConstraints = false
+
+        // ---- 中部：导出选项 ----
+        optionsCard.backgroundColor = BKTheme.Color.panel
+        optionsCard.layer.cornerRadius = BKTheme.Radius.card
+        optionsCard.layer.borderWidth = 1
+        optionsCard.layer.borderColor = BKTheme.Color.line.cgColor
+
+        let resTitle = sectionTitle("分辨率")
+        let fpsTitle = sectionTitle("帧率")
+
+        resSeg.selectedSegmentIndex = 0
+        styleSeg(resSeg)
+        resSeg.addTarget(self, action: #selector(specChanged), for: .valueChanged)
+
+        fpsSeg.selectedSegmentIndex = 0
+        styleSeg(fpsSeg)
+        fpsSeg.addTarget(self, action: #selector(specChanged), for: .valueChanged)
+
+        summaryLabel.font = BKTheme.Font.caption
+        summaryLabel.textColor = BKTheme.Color.text2
+        summaryLabel.numberOfLines = 2
+
+        let optStack = UIStackView(arrangedSubviews: [resTitle, resSeg, fpsTitle, fpsSeg, summaryLabel])
+        optStack.axis = .vertical
+        optStack.spacing = 6
+        optStack.alignment = .fill
+        optionsCard.addSubview(optStack)
+
+        // ---- 底部：主行动按钮（常蓝，未选时点了才提示）----
+        exportButton.setTitle("开始导出", for: .normal)
+        exportButton.titleLabel?.font = BKTheme.Font.button
+        exportButton.setTitleColor(.white, for: .normal)
+        exportButton.backgroundColor = BKTheme.Color.accent
+        exportButton.layer.cornerRadius = 22
+        exportButton.addTarget(self, action: #selector(exportTapped), for: .touchUpInside)
+
+        for v in [tableView, optionsCard, exportButton, optStack] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+        }
         view.addSubview(tableView)
+        view.addSubview(optionsCard)
+        view.addSubview(exportButton)
+
         NSLayoutConstraint.activate([
             tableView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
             tableView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             tableView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            tableView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+            tableView.bottomAnchor.constraint(equalTo: optionsCard.topAnchor, constant: -8),
+
+            optionsCard.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: BKTheme.Space.lg),
+            optionsCard.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -BKTheme.Space.lg),
+            optionsCard.heightAnchor.constraint(equalToConstant: 190),
+            optionsCard.bottomAnchor.constraint(equalTo: exportButton.topAnchor, constant: -BKTheme.Space.md),
+
+            optStack.topAnchor.constraint(equalTo: optionsCard.topAnchor, constant: 12),
+            optStack.leadingAnchor.constraint(equalTo: optionsCard.leadingAnchor, constant: 12),
+            optStack.trailingAnchor.constraint(equalTo: optionsCard.trailingAnchor, constant: -12),
+
+            exportButton.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: BKTheme.Space.lg),
+            exportButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -BKTheme.Space.lg),
+            exportButton.heightAnchor.constraint(equalToConstant: 48),
+            exportButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor,
+                                                 constant: -BKTheme.Space.md)
         ])
     }
+
+    private func sectionTitle(_ t: String) -> UILabel {
+        let l = UILabel()
+        l.text = t
+        l.font = BKTheme.Font.caption
+        l.textColor = BKTheme.Color.text2
+        return l
+    }
+
+    private func styleSeg(_ seg: UISegmentedControl) {
+        seg.backgroundColor = BKTheme.Color.panel2
+        seg.setTitleTextAttributes([.foregroundColor: BKTheme.Color.text], for: .normal)
+        seg.setTitleTextAttributes([.foregroundColor: UIColor.white], for: .selected)
+    }
+
+    // MARK: - 数据
 
     private func reload() {
         batch = BKDraftStore.shared.batch(id: batchID)
@@ -95,13 +167,42 @@ final class BKBatchListViewController: UIViewController {
             selected.removeAll()
         }
         tableView.reloadData()
-        updateExportButton()
+        updateSummary()
+    }
+
+    /// 当前选中的导出规格（整批统一）
+    private func currentSpec() -> BKConfig.ExportSpec {
+        let r = BKConfig.Resolution.allCases[resSeg.selectedSegmentIndex]
+        let f = BKConfig.FrameRate.allCases[fpsSeg.selectedSegmentIndex]
+        return BKConfig.ExportSpec(resolution: r, frameRate: f)
+    }
+
+    /// 已选素材的成品时长合计（没删过红的按原时长算）
+    private func totalSeconds(_ indices: [Int]) -> Double {
+        guard let b = batch else { return 0 }
+        var sum = 0.0
+        for i in indices where b.items.indices.contains(i) {
+            let it = b.items[i]
+            sum += it.trimmedDuration ?? (it.duration ?? BKVideoLibrary.duration(localID: it.localID))
+        }
+        return sum
+    }
+
+    private func updateSummary() {
+        let n = selected.count
+        exportButton.setTitle(n > 0 ? "开始导出 \(n) 条" : "开始导出", for: .normal)
+        let total = totalSeconds(Array(selected))
+        summaryLabel.text = "已选 \(n) 条 · 合计 \(BatchRowCell.clock(total))\n规格：\(currentSpec().summary)"
     }
 
     // MARK: - 动作
 
     @objc private func backTapped() {
         navigationController?.popViewController(animated: true)
+    }
+
+    @objc private func specChanged() {
+        updateSummary()
     }
 
     @objc private func selectAllTapped() {
@@ -112,13 +213,20 @@ final class BKBatchListViewController: UIViewController {
             selected = Set(0 ..< b.items.count)
         }
         tableView.reloadData()
-        updateExportButton()
+        updateSummary()
     }
 
-    private func updateExportButton() {
-        let n = selected.count
-        exportButton.title = n == 0 ? "导出选中" : "导出选中 \(n)"
-        exportButton.isEnabled = n > 0
+    @objc private func exportTapped() {
+        guard let b = batch else { return }
+        guard !selected.isEmpty else {
+            // 按钮保持蓝色不置灰（皓哥定），未选时点了给明确提示
+            let a = UIAlertController(title: nil, message: "未选择视频，无法导出", preferredStyle: .alert)
+            a.addAction(UIAlertAction(title: "好", style: .cancel))
+            present(a, animated: true)
+            return
+        }
+        let items = selected.sorted().compactMap { b.items.indices.contains($0) ? b.items[$0] : nil }
+        runExport(items: items)
     }
 
     /// 导航到某条编辑页：把 nav 栈重排成 [首页, 编辑器]，避免 首页→编辑器→列表→编辑器 无限堆叠
@@ -128,16 +236,10 @@ final class BKBatchListViewController: UIViewController {
         nav.setViewControllers([root, editor], animated: true)
     }
 
-    @objc private func exportSelectedTapped() {
-        guard let b = batch, !selected.isEmpty else { return }
-        let items = selected.sorted().compactMap { b.items.indices.contains($0) ? b.items[$0] : nil }
-        runExport(items: items)
-    }
-
     private func toggle(_ index: Int) {
         if selected.contains(index) { selected.remove(index) } else { selected.insert(index) }
         tableView.reloadRows(at: [IndexPath(item: index, section: 0)], with: .none)
-        updateExportButton()
+        updateSummary()
     }
 
     // MARK: - 批量导出（逐条排队，单条失败继续，末弹汇总）
@@ -145,7 +247,8 @@ final class BKBatchListViewController: UIViewController {
     private func runExport(items: [BKClipItem]) {
         let hud = UIAlertController(title: "正在导出", message: "准备中…", preferredStyle: .alert)
         present(hud, animated: true)
-        let spec = BKConfig.ExportSpec()
+        // ★ 用页面上选的规格（整批统一），不再写死同源
+        let spec = currentSpec()
         var ok = 0
         var failed: [String] = []
 
@@ -315,8 +418,8 @@ final class BatchRowCell: UITableViewCell {
         checkButton.tintColor = selected ? BKTheme.Color.accent : BKTheme.Color.text2
     }
 
-    /// mm:ss。列表里一律用这个口径，别出现「1:23」和「01:23」两种写法
-    private static func clock(_ t: Double) -> String {
+    /// mm:ss。列表与合计时长共用这一个口径，别出现「1:23」和「01:23」两种写法
+    static func clock(_ t: Double) -> String {
         let s = max(0, t)
         return String(format: "%02d:%02d", Int(s) / 60, Int(s) % 60)
     }

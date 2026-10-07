@@ -1034,19 +1034,18 @@ final class BKEditorViewController: UIViewController {
 
     // MARK: - 导出 / 返回
 
+    /// 导出：统一走「本批清单 + 导出选项 + 开始导出」那一页，并**自动勾选当前这条**。
+    /// 不再单独弹导出面板 —— 那会造成「批量导出选不了规格、单条反而能选」两套行为打架
     @objc private func exportTapped() {
-        guard let asset = asset, assetTotal > 0 else {
+        guard let bid = batchID, assetTotal > 0 else {
             statusLabel.text = "素材未就绪，无法导出"
             return
         }
         stopPlayback()
-        let title = (BKVideoLibrary.assetName(localID: localID) as NSString)
-            .deletingPathExtension
-        // 折叠态直接吃 keepBase；未折叠吃 cuts 派生出的保留段（源时间，绝对坐标）
-        let keeps = keepBase ?? BKDetector.keptSegments(cuts, totalSec: assetTotal)
-        let panel = BKExportPanelViewController(asset: asset, keeps: keeps, title: title)
-        let nav = UINavigationController(rootViewController: panel)
-        present(nav, animated: true)
+        // 先落盘：合并页是从草稿里读刀口的，不落的话刚改的刀口可能还没写进去
+        persistItem()
+        let page = BKBatchListViewController(batchID: bid, preselect: itemIndex)
+        navigationController?.pushViewController(page, animated: true)
     }
 
     @objc private func closeTapped() {
