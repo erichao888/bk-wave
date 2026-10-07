@@ -1014,7 +1014,11 @@ final class BKEditorViewController: UIViewController {
         }
         playMode = .idle
         if total > 0 {
-            player.seek(to: CMTime(seconds: lastTime, preferredTimescale: 600),
+            // ★ lastTime 是**显示时间**，而这里 player 已经切回原片 item（源时间轴）。
+            //   折叠态两者不是一回事，不换算会把画面 seek 到错误的源位置。
+            //   未折叠时 sourceTime 恒等，所以这一改对普通情况零影响
+            let src = sourceTime(of: lastTime)
+            player.seek(to: CMTime(seconds: src, preferredTimescale: 600),
                         toleranceBefore: .zero, toleranceAfter: .zero)
         }
         updatePlayIcons()
@@ -1131,6 +1135,11 @@ final class BKEditorViewController: UIViewController {
         var acc = 0.0
         for (s, e) in base {
             let len = max(0, e - s)
+            // ★ 源时间落在**被删掉的红区里**（还没到下一段起点）→ 停在上一段末尾（接缝处）。
+            //   没有这一条的话，红区内的源时间会一路走到函数末尾 return acc（= 所有保留段
+            //   之和 = 结尾），指针在折叠态原片播经过红区时会瞬间跳到结尾、出了红区再跳回来。
+            //   （▶ 原片播的语义就是红区绿区都播，所以指针停在缝上、画面继续往前走是对的）
+            if srcT < s { return acc }
             if srcT >= s - 1e-9 && srcT <= e + 1e-9 {
                 return acc + max(0, srcT - s)
             }
