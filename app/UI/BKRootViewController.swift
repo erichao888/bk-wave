@@ -226,6 +226,16 @@ final class BKRootViewController: UICollectionViewController {
                   message: "\(n) 批已移入回收站，\(BKConfig.Draft.trashKeepDays) 天内可在左上角回收站里恢复。")
     }
 
+    @objc private func selectAllTapped() {
+        if selected.count == batches.count {
+            selected.removeAll()
+        } else {
+            selected = Set(0 ..< batches.count)
+        }
+        collectionView.reloadData()
+        updateTrashBar()
+    }
+
     private func showAlert(title: String, message: String) {
         let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "好", style: .cancel))
