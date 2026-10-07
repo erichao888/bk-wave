@@ -205,20 +205,15 @@ final class BKEditorViewController: UIViewController {
     private func setupNav() {
         // 标题在 loadMaterial 里按草稿名设置
 
-        // 左上角返回（关闭）：回首页草稿列表
+        // 左上角只留返回。原来的「☰ 本批清单」按皓哥要求取消（2026-10-08）——
+        // 它的作用已被「导出页」接管：那里上半屏就是本批清单 + 勾选，
+        // 从首页格子的「···」菜单或本页右上「导出」都能进，不必再占一个导航位
         let backItem = UIBarButtonItem(image: UIImage(systemName: "chevron.backward"),
                                        style: .plain,
                                        target: self,
                                        action: #selector(closeTapped))
         backItem.accessibilityLabel = "返回草稿列表"
-
-        // ☰ 素材清单：本批所有素材，点开勾选导出 / 切换编辑
-        let listItem = UIBarButtonItem(image: UIImage(systemName: "line.3.horizontal"),
-                                       style: .plain,
-                                       target: self,
-                                       action: #selector(listTapped))
-        listItem.accessibilityLabel = "本批素材清单"
-        navigationItem.leftBarButtonItems = [backItem, listItem]
+        navigationItem.leftBarButtonItem = backItem
 
         // 导出放导航栏右上角（ck 的导出在主编辑页；本 App 波剪页就是全部工作台）
         let exportItem = UIBarButtonItem(title: "导出",
@@ -1149,13 +1144,6 @@ final class BKEditorViewController: UIViewController {
         let w = DispatchWorkItem { [weak self] in self?.persistItem() }
         persistWork = w
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: w)
-    }
-
-    /// ☰ 打开本批素材清单
-    @objc private func listTapped() {
-        guard let bid = batchID else { return }
-        let list = BKBatchListViewController(batchID: bid)
-        navigationController?.pushViewController(list, animated: true)
     }
 
     /// 拖动/点选时把原片 player seek 到该源时间（暂停态下只更新画面）
