@@ -611,7 +611,6 @@ enum BKExporter {
             BKLog.shared.d("降帧：丢掉 \(droppedFrames) 帧")
         }
     }
-}
 
     // MARK: - 存相册（多视频批量导出复用）
 
@@ -645,6 +644,7 @@ enum BKExporter {
             completion(false)
         }
     }
+}
 
 // MARK: - 错误定义
 
