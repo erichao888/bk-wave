@@ -27,6 +27,7 @@
 
 import Foundation
 import AVFoundation
+import Photos
 
 enum BKExporter {
 
@@ -611,6 +612,39 @@ enum BKExporter {
         }
     }
 }
+
+    // MARK: - 存相册（多视频批量导出复用）
+
+    /// 用 PHAssetCreationRequest 指定 originalFilename，保证相册里文件名 = 导出文件名
+    /// （BK_…mp4，带 _k 序号）。失败回传 false，由调用方决定怎么提示。
+    static func saveToPhotos(url: URL, fileName: String, completion: @escaping (Bool) -> Void) {
+        func proceed() {
+            PHPhotoLibrary.shared().performChanges({
+                let req = PHAssetCreationRequest.forAsset()
+                let opt = PHAssetResourceCreationOptions()
+                opt.originalFilename = fileName
+                req.addResource(with: .video, fileURL: url, options: opt)
+            }, completionHandler: { ok, _ in
+                DispatchQueue.main.async { completion(ok) }
+            })
+        }
+        let status: PHAuthorizationStatus
+        if #available(iOS 14, *) {
+            status = PHPhotoLibrary.authorizationStatus(for: .addOnly)
+        } else {
+            status = PHPhotoLibrary.authorizationStatus()
+        }
+        switch status {
+        case .authorized, .limited:
+            proceed()
+        case .notDetermined:
+            PHPhotoLibrary.requestAuthorization { st in
+                if st == .authorized || st == .limited { proceed() } else { completion(false) }
+            }
+        default:
+            completion(false)
+        }
+    }
 
 // MARK: - 错误定义
 

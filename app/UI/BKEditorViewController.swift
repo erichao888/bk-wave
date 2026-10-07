@@ -58,7 +58,11 @@ final class BKEditorViewController: UIViewController {
 
     // MARK: - 数据
 
-    private let localID: String
+    /// 当前素材的相册 localID（从草稿批里取，加载后才有值）
+    private var localID: String = ""
+    /// 所属草稿批 + 批内序号；编辑器必须挂在某个批里工作
+    private let batchID: UUID?
+    private let itemIndex: Int
     private var asset: AVAsset?
     private var envelope: BKEnvelope?
     private var total: Double = 0
@@ -81,6 +85,11 @@ final class BKEditorViewController: UIViewController {
     private var autoThresholdDb: Double?
     /// 素材是否适用静音检测（带 BGM/响度归一化的判不适用）
     private var applicable = true
+
+    /// 用户是否动过刀（决定 ☰ 列表里文件名是否标红）
+    private var everEdited: Bool = false
+    /// 落盘 debounce 任务
+    private var persistWork: DispatchWorkItem?
 
     /// 撤销 / 重做栈
     private var undoStack: [EditState] = []
@@ -131,8 +140,9 @@ final class BKEditorViewController: UIViewController {
 
     // MARK: - 初始化
 
-    init(localID: String) {
-        self.localID = localID
+    init(batchID: UUID, index: Int) {
+        self.batchID = batchID
+        self.itemIndex = index
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -158,6 +168,7 @@ final class BKEditorViewController: UIViewController {
     }
 
     override func viewWillDisappear(_ animated: Bool) {
+        persistItem()
         super.viewWillDisappear(animated)
         navigationController?.interactivePopGestureRecognizer?.isEnabled = true
         stopPlayback()
@@ -189,22 +200,21 @@ final class BKEditorViewController: UIViewController {
     // MARK: - 导航栏
 
     private func setupNav() {
-        navigationItem.title = BKVideoLibrary.assetName(localID: localID)
+        // 标题在 loadMaterial 里按草稿名设置
 
-        // 左上角返回（关闭）
+        // 左上角返回（关闭）：回首页草稿列表
         let backItem = UIBarButtonItem(image: UIImage(systemName: "chevron.backward"),
                                        style: .plain,
                                        target: self,
                                        action: #selector(closeTapped))
-        backItem.accessibilityLabel = "返回选择页"
+        backItem.accessibilityLabel = "返回草稿列表"
 
-        // ☰ 素材清单：bk波剪一次只有一条素材，按键置灰保留布局（与 ck 单块素材时一致）
+        // ☰ 素材清单：本批所有素材，点开勾选导出 / 切换编辑
         let listItem = UIBarButtonItem(image: UIImage(systemName: "line.3.horizontal"),
                                        style: .plain,
-                                       target: nil,
-                                       action: nil)
-        listItem.isEnabled = false
-        listItem.accessibilityLabel = "单素材版无素材列表"
+                                       target: self,
+                                       action: #selector(listTapped))
+        listItem.accessibilityLabel = "本批素材清单"
         navigationItem.leftBarButtonItems = [backItem, listItem]
 
         // 导出放导航栏右上角（ck 的导出在主编辑页；本 App 波剪页就是全部工作台）
@@ -525,6 +535,16 @@ final class BKEditorViewController: UIViewController {
     // MARK: - 加载素材
 
     private func loadMaterial() {
+        guard let bid = batchID,
+              let batch = BKDraftStore.shared.batch(id: bid),
+              batch.items.indices.contains(itemIndex) else {
+            statusLabel.text = "草稿找不到（可能已被删除）"
+            return
+        }
+        let item = batch.items[itemIndex]
+        self.localID = item.localID
+        navigationItem.title = item.assetName
+
         spinner.startAnimating()
         setControlsEnabled(false)
         statusLabel.text = "正在提取音频波形…"
@@ -540,9 +560,9 @@ final class BKEditorViewController: UIViewController {
             self.asset = asset
             DispatchQueue.main.async {
                 // 原片 item 常驻；联播只临时换 item，绝不重建 AVPlayer
-                let item = AVPlayerItem(asset: asset)
-                self.originalItem = item
-                self.player.replaceCurrentItem(with: item)
+                let it = AVPlayerItem(asset: asset)
+                self.originalItem = it
+                self.player.replaceCurrentItem(with: it)
             }
             BKAudioAnalyzer.extractEnvelope(from: asset) { [weak self] result in
                 guard let self = self else { return }
@@ -557,13 +577,42 @@ final class BKEditorViewController: UIViewController {
                         self.lastTime = 0
                         self.timeLabel.text = "\(self.formatClock(0)) / \(self.formatClock(self.total))"
                         self.setControlsEnabled(true)
-                        self.runDetection(override: nil)
+                        // 草稿里已有刀口 → 直接还原，不重跑自动检测（保留上次手调结果）
+                        if item.everEdited || !item.cuts.isEmpty || item.keepBase != nil {
+                            self.restoreEdits(from: item)
+                        } else {
+                            self.runDetection(override: nil)
+                        }
                     case .failure(let err):
                         self.statusLabel.text = "包络提取失败：\(err.localizedDescription)"
                     }
                 }
             }
         }
+    }
+
+    /// 从草稿还原编辑态（刀口 / 折叠 / 阈值），不重跑 Otsu
+    private func restoreEdits(from item: BKClipItem) {
+        self.cuts = item.cuts.tuples
+        self.keepBase = item.keepBase?.tuples
+        self.thresholdDb = item.thresholdDb
+        self.autoThresholdDb = item.autoThresholdDb
+        self.everEdited = item.everEdited
+        self.thresholdSlider.value = Float(self.thresholdDb)
+        self.thresholdTitle.text = String(format: "阈值 %.1f dB", self.thresholdDb)
+        if let base = self.keepBase {
+            self.total = base.reduce(0.0) { $0 + max(0, $1.1 - $1.0) }
+            self.marks = []
+            self.statusLabel.text = String(format: "已还原 %d 段保留（剪后 %.1fs）", base.count, self.total)
+        } else {
+            self.marks = BKTimeline.build(duration: self.assetTotal, cuts: self.cuts)
+            self.statusLabel.text = self.cuts.isEmpty
+                ? "这条还没动过刀"
+                : String(format: "已还原 %d 处气口", self.cuts.count)
+        }
+        self.refreshTrack()
+        self.updateInfo()
+        self.updateThresholdAutoButton()
     }
 
     // MARK: - 检测
@@ -615,6 +664,11 @@ final class BKEditorViewController: UIViewController {
                 self.updateInfo()
                 self.updateUndoButtons()
                 self.updateThresholdAutoButton()
+                // 手动重检（拖阈值 / 点💉）算「动过刀」；首次自动检测不算
+                if recordUndo {
+                    self.everEdited = true
+                    self.schedulePersist()
+                }
             }
         }
     }
@@ -693,6 +747,7 @@ final class BKEditorViewController: UIViewController {
         }
         refreshTrack()
         updateInfo()
+        schedulePersist()
     }
 
     @objc private func undoTapped() {
@@ -770,6 +825,8 @@ final class BKEditorViewController: UIViewController {
                                   cuts.count, keeps.count, folded)
         // 折叠后红区已并入主轨之外，删除区间无需再持有
         cuts = []
+        everEdited = true
+        schedulePersist()
     }
 
     /// 点段 toggle 绿↔红。命中用 `pieces`（含 ✂ 分割线），
@@ -798,6 +855,8 @@ final class BKEditorViewController: UIViewController {
         } else {
             statusLabel.text = String(format: "删掉 %.2f~%.2fs", piece.start, piece.end)
         }
+        everEdited = true
+        schedulePersist()
     }
 
     /// marks → 连续 cut 段（源时间），作为 cuts 的唯一来源
@@ -995,6 +1054,36 @@ final class BKEditorViewController: UIViewController {
         navigationController?.popViewController(animated: true)
     }
 
+    // MARK: - 草稿持久化
+
+    /// 把当前编辑态写回所属草稿批（整批 JSON 落盘）
+    private func persistItem() {
+        guard let bid = batchID else { return }
+        guard var batch = BKDraftStore.shared.batch(id: bid),
+              batch.items.indices.contains(itemIndex) else { return }
+        batch.items[itemIndex].cuts = self.cuts.ranges
+        batch.items[itemIndex].keepBase = self.keepBase?.ranges
+        batch.items[itemIndex].thresholdDb = self.thresholdDb
+        batch.items[itemIndex].autoThresholdDb = self.autoThresholdDb
+        batch.items[itemIndex].everEdited = self.everEdited
+        BKDraftStore.shared.save(batch)
+    }
+
+    /// debounce 落盘：编辑过程中最多每 1s 写一次，退页面时再强制写一次
+    private func schedulePersist() {
+        persistWork?.cancel()
+        let w = DispatchWorkItem { [weak self] in self?.persistItem() }
+        persistWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: w)
+    }
+
+    /// ☰ 打开本批素材清单
+    @objc private func listTapped() {
+        guard let bid = batchID else { return }
+        let list = BKBatchListViewController(batchID: bid)
+        navigationController?.pushViewController(list, animated: true)
+    }
+
     /// 拖动/点选时把原片 player seek 到该源时间（暂停态下只更新画面）
     private func seekOriginal(to t: Double) {
         guard player.currentItem != nil else { return }
@@ -1111,6 +1200,8 @@ extension BKEditorViewController: BKTrackViewDelegate {
         marks = BKTimeline.build(duration: assetTotal, cuts: cuts)
         refreshTrack()
         updateInfo()
+        everEdited = true
+        schedulePersist()
     }
 
     func trackDidEndRedEdgeDrag(_ view: BKTrackView) {

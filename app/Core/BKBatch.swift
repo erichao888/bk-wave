@@ -1,0 +1,69 @@
+//
+//  BKBatch.swift
+//  bk波剪 — 批（一次导入的多条视频）与单条素材编辑态
+//
+//  【为什么单独一套模型】
+//  bk波剪是「一次导入一批 → 逐条进波剪页手调 → ☰ 列表勾选批量导出」。
+//  一格 = 一批，批里每条独立存编辑态。这和 bk剪辑 v1.2.7 的
+//  BKDraftBatch → BKProject[] 两层模型一致，但字段精简到 bk波剪用得上的。
+//
+//  【全部 Codable：整批 JSON 落盘】
+//  元组 [(Double, Double)] 不可序列化，所以源时间区间用 BKRange 结构体承载；
+//  编辑态读写在元组与 BKRange 之间转换（见下方 extension）。
+//
+
+import Foundation
+
+/// 源时间区间（可 Codable —— 元组不可序列化，落盘专用）
+struct BKRange: Codable, Equatable {
+    var start: Double
+    var end: Double
+
+    var tuple: (Double, Double) { (start, end) }
+    init(start: Double, end: Double) { self.start = start; self.end = end }
+    init(_ t: (Double, Double)) { self.start = t.0; self.end = t.1 }
+}
+
+extension Array where Element == BKRange {
+    /// [BKRange] → [(Double, Double)]，喂给编辑器/BKDetector
+    var tuples: [(Double, Double)] { map { $0.tuple } }
+}
+
+extension Array where Element == (Double, Double) {
+    /// [(Double, Double)] → [BKRange]，落盘前转换
+    var ranges: [BKRange] { map { BKRange($0) } }
+}
+
+/// 批里的一条素材及其编辑态。
+struct BKClipItem: Codable, Identifiable {
+    var id: UUID
+    /// 相册 localID（加载 AVAsset 用）
+    var localID: String
+    /// 素材名（去扩展名），列表展示用，落盘免得每次查相册
+    var assetName: String
+    /// 源时间删除区间（与 BKEditorViewController.cuts 同一口径）
+    var cuts: [BKRange]
+    /// 折叠后的保留段；nil = 未折叠（红区还在，cuts 是删除区间）
+    var keepBase: [BKRange]?
+    var thresholdDb: Double
+    var autoThresholdDb: Double?
+    /// 用户是否动过刀（决定 ☰ 列表里文件名是否标红）
+    var everEdited: Bool
+
+    /// 「删过红区」：用户动过刀，或已经折叠红区
+    var hasDeletedRed: Bool { everEdited || keepBase != nil }
+}
+
+/// 一次导入的多条视频 = 一批。
+struct BKBatch: Codable, Identifiable {
+    var id: UUID
+    var title: String
+    var items: [BKClipItem]
+    var createdAt: Date
+    var lastEditedAt: Date
+
+    /// 标题缺省时按条数生成，保证列表有字
+    var displayTitle: String {
+        title.isEmpty ? String(format: "未命名 %d 条", items.count) : title
+    }
+}
