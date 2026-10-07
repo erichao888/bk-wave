@@ -113,6 +113,22 @@ enum BKHandleEnd {
 
 enum BKTimeline {
 
+    /// [0, duration] 上 keeps 的**补集** —— 也就是「除了这些保留段，其余都要删」。
+    ///
+    /// 用于「退折叠」：折叠时 cuts → keepBase（保留段），退折叠时靠这个函数原路还原成 cuts。
+    /// 因为 keepBase 本来就是 cuts 的补集，所以**往返一次导出结果完全不变**，手调也不会丢。
+    static func complement(_ keeps: [(Double, Double)], duration: Double) -> [(Double, Double)] {
+        let merged = merge(keeps, duration: duration)
+        var out: [(Double, Double)] = []
+        var cursor = 0.0
+        for (s, e) in merged {
+            if s > cursor { out.append((cursor, min(s, duration))) }
+            cursor = max(cursor, e)
+        }
+        if cursor < duration { out.append((cursor, duration)) }
+        return out
+    }
+
     /// 把一串切点和总时长合成完整的区间序列。这是从检测到可编辑状态的唯一入口。
     static func build(duration: Double, cuts: [(Double, Double)]) -> [BKMark] {
         var marks: [BKMark] = []

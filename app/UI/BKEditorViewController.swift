@@ -24,8 +24,10 @@
 //  两者起点都是指针那一帧（指针在红区时联播跳到下一个绿区），互斥。
 //  停止一律**停在原地**（ck 定稿 4.5.2）。
 //
-//  ✗✗ 键在单素材版里的语义 = 「清空全部红区」（ck 里它是「删红折叠进第二阶段」，
-//  bk波剪没有第二阶段，cuts 就是最终删除区间，所以等价动作是全部恢复）。
+//  ✗✗ 键 = **折叠 / 退折叠两态**（像播放↔暂停）：
+//  未折叠时按它 = 删红折叠（红区收进黑区，主轨只剩保留段）；
+//  已折叠时再按 = 退折叠（红区原路回到 cuts，可继续点段转红 / 拖红区边缘精修）。
+//  折叠只是 cuts 的另一种表示（keepBase = cuts 的补集），**往返无损**：导出结果不变、手调不丢。
 //  ✕ 键 = 把这条从本批素材列表清除，并**自动跳到下一条继续剪**（ck 里它就是「从批次移除」）。
 //  废片（整条口播都不对）没必要剪也没必要导，清掉后接着剪下一条，流程不中断。
 //
@@ -678,6 +680,7 @@ final class BKEditorViewController: UIViewController {
 
     /// 轨道 + 概览条一起刷新。分开刷迟早会出现「轨道已经切了，概览条还画着旧的」
     private func refreshTrack() {
+        updateDeleteRedButton()   // ✗✗ 两态图标跟着 keepBase 走
         if let base = keepBase {
             // 折叠态：轨道画成「成品时间轴」，靠 foldMap 把显示坐标映射回原片包络
             var acc = 0.0
@@ -811,12 +814,16 @@ final class BKEditorViewController: UIViewController {
         refreshTrack()
     }
 
-    /// ✗✗ = 折叠红区：把当前红区（删除区间）对应的视频段真正从主轨去掉，
-    /// 只留绿区拼成新主轨。ck v2.0 的「删红折叠」同款语义。
-    /// 不是「清空红区」—— 那等于什么都不删（旧实现的反向 bug）。
+    /// ✗✗ = **折叠 / 退折叠两态键**（像播放↔暂停）
+    ///
+    /// 未折叠时：把当前红区（删除区间）对应的视频段真正从主轨去掉，只留绿区拼成新主轨
+    ///（ck v2.0 的「删红折叠」同款语义）。不是「清空红区」—— 那等于什么都不删（旧实现的反向 bug）。
+    /// 已折叠时：走 `unfold()` 把红区放回去，回到可编辑状态。
     @objc private func deleteRedTapped() {
-        guard keepBase == nil else {
-            statusLabel.text = "已经折叠过红区了，拖动阈值重检可还原"
+        // ★ 两态键（像播放↔暂停，皓哥 2026-10-08 定）：
+        //   未折叠 → 折叠删红；已折叠 → 退折叠，把红区放回去接着精修
+        if keepBase != nil {
+            unfold()
             return
         }
         guard !cuts.isEmpty else {
@@ -840,6 +847,49 @@ final class BKEditorViewController: UIViewController {
         cuts = []
         everEdited = true
         schedulePersist()
+    }
+
+    /// 退折叠：把折叠收走的红区**原路还原**回 cuts，回到可编辑状态。
+    ///
+    /// 为什么能原路还原：折叠只是 cuts 的另一种表示（keepBase 就是 cuts 的补集），
+    /// 所以 `BKTimeline.complement` 一转就回到折叠前的删除区间 ——
+    /// ★ **导出结果完全不变、手调的刀一个都不丢**（与「拖阈值重检」完全不同，那个会整体重算）。
+    ///
+    /// 典型用法：一键删红 → 播放/联播发现还有错处没删 → 本键退折叠 → 点段转红或拖红区边缘
+    /// 精修 → 再按本键折叠。
+    private func unfold() {
+        guard let base = keepBase else { return }
+        pushUndo()
+        cuts = BKTimeline.complement(base, duration: assetTotal)
+        keepBase = nil
+        total = assetTotal
+        marks = BKTimeline.build(duration: assetTotal, cuts: cuts)
+        splits = []          // 折叠态的分割线是**成品轴**坐标，换回源轴必须清掉
+        redCount = 0
+        lastTime = 0         // 时间轴从成品轴变回源轴，指针回起点
+        refreshTrack()
+        updateInfo()
+        syncPlayhead(to: 0)
+        everEdited = true
+        schedulePersist()
+        if cuts.isEmpty {
+            statusLabel.text = "已退折叠 · 这条素材当前没有红区（整条都保留）"
+        } else {
+            statusLabel.text = String(format: "已退折叠 · %d 处红区回来了，可点段转红 / 拖红区边缘精修，改完再按本键折叠", cuts.count)
+        }
+    }
+
+    /// ✗✗ 是折叠 / 退折叠两态键，图标和底色都要跟着当前状态变（否则用户看不出它现在会干什么）
+    private func updateDeleteRedButton() {
+        if keepBase != nil {
+            let cfg = UIImage.SymbolConfiguration(pointSize: 18, weight: .regular)
+            deleteRedButton.setImage(UIImage(systemName: "arrow.uturn.backward",
+                                              withConfiguration: cfg), for: .normal)
+            deleteRedButton.backgroundColor = BKTheme.Color.selectBg
+        } else {
+            deleteRedButton.setImage(BKIcons.deleteRedDoubleX(), for: .normal)
+            deleteRedButton.backgroundColor = BKTheme.Color.panel
+        }
     }
 
     /// 点段 toggle 绿↔红。命中用 `pieces`（含 ✂ 分割线），
