@@ -5,9 +5,11 @@
 //  删除草稿不是真删：BKBatch 打上 deletedAt 标记，30 天内可恢复。
 //  过期（deletedAt 超过 BKConfig.Draft.trashKeepDays）的进页面时自动清掉。
 //
-//  【两个快捷键（皓哥 2026-10-08 要求）】
-//  · 导航右上「选择」→ 多选态，底栏「彻底删除 (N)」+「全选」
-//  · 导航右上「清空」→ 一键清空回收站（二次确认，不可恢复）
+//  【三个键，默认状态就都看得见（皓哥 2026-10-08）】
+//  · 导航右上「全选」→ 一键全选并进入多选态（再按变「取消」退出）
+//  · 导航右上「清空」→ 一键清空回收站（全部真删，二次确认）
+//  · 多选态底栏「彻底删除 (N)」；单个勾选/取消 = 点行
+//  （原来「全选」藏在多选态底栏里，不直观，等于没有）
 //
 
 import UIKit
@@ -19,8 +21,10 @@ final class BKTrashViewController: UITableViewController {
     private var selected = Set<Int>()
 
     private let emptyLabel = UILabel()
-    private lazy var pickButton = UIBarButtonItem(title: "选择", style: .plain,
+    /// 非多选态显示「全选」（一点直接全选并进入多选态）、多选态显示「取消」
+    private lazy var pickButton = UIBarButtonItem(title: "全选", style: .plain,
                                                    target: self, action: #selector(pickTapped))
+    /// 清空回收站（真删全部）
     private lazy var clearButton = UIBarButtonItem(title: "清空", style: .plain,
                                                    target: self, action: #selector(clearTapped))
 
@@ -70,11 +74,23 @@ final class BKTrashViewController: UITableViewController {
 
     // MARK: - 选择 / 清空
 
+    /// 「全选 / 取消」两态键：
+    /// 非多选态 = 直接**全选并进入多选态**（省掉「先进多选再全选」两次点按）；
+    /// 多选态 = 退出多选并清空勾选。单个勾选/取消靠**点行**完成。
     @objc private func pickTapped() {
-        picking.toggle()
-        if !picking { selected.removeAll() }
-        pickButton.title = picking ? "取消" : "选择"
-        navigationController?.setToolbarHidden(!picking, animated: false)
+        if picking {
+            picking = false
+            selected.removeAll()
+            pickButton.title = "全选"
+            navigationController?.setToolbarHidden(true, animated: false)
+            reload()
+            return
+        }
+        guard !rows.isEmpty else { return }
+        picking = true
+        selected = Set(0 ..< rows.count)
+        pickButton.title = "取消"
+        navigationController?.setToolbarHidden(false, animated: false)
         reload()
     }
 
@@ -95,16 +111,6 @@ final class BKTrashViewController: UITableViewController {
         present(alert, animated: true)
     }
 
-    @objc private func selectAllTapped() {
-        if selected.count == rows.count {
-            selected.removeAll()
-        } else {
-            selected = Set(0 ..< rows.count)
-        }
-        tableView.reloadData()
-        updateBar()
-    }
-
     @objc private func deleteSelectedTapped() {
         guard !selected.isEmpty else { return }
         let n = selected.count
@@ -123,15 +129,14 @@ final class BKTrashViewController: UITableViewController {
         present(alert, animated: true)
     }
 
+    /// 底栏只留「彻底删除」——全选已提到导航右上，按钮不在这里重复
     private func updateBar() {
         guard picking else { return }
         let del = UIBarButtonItem(title: selected.isEmpty ? "彻底删除" : "彻底删除 (\(selected.count))",
                                   style: .plain, target: self, action: #selector(deleteSelectedTapped))
         del.tintColor = BKTheme.Color.danger
-        let all = UIBarButtonItem(title: "全选", style: .plain, target: self,
-                                  action: #selector(selectAllTapped))
         let spacer = UIBarButtonItem(barButtonSystemItem: .flexibleSpace, target: nil, action: nil)
-        toolbarItems = [del, spacer, all]
+        toolbarItems = [del, spacer]
     }
 
     // MARK: - 表格
