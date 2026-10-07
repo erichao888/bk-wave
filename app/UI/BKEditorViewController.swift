@@ -2,27 +2,58 @@
 //  BKEditorViewController.swift
 //  bk波剪 — 波剪页（单素材：看波形 → 切气口 → 导出）
 //
-//  【本页职责】
-//  选完一条视频进来，这一页就是全部工作台：
-//    · 顶部预览播放原片，播放头与下方波形指针同步
-//    · 中间主轨道：橙/白指针钉中央，波形按时间展开，红罩=要删的气口
-//    · 底部概览条：永远显示全局 + 橙色视窗框
-//    · 阈值滑杆：左静右响，拖动即按该阈值重检气口
-//    · 点绿/红段 → 反选（留/删）；拖红区边缘 → 调气口大小
-//    · 「试听剪后」用 composition 听去掉气口的成品；「导出」进导出面板
+//  【这份代码的上级 = ck剪辑 v2.0 波剪子页的界面布局（皓哥 2026-10-07 截图拍板）】
+//  布局照 ck v2.0 移植：导航栏（返回+清单+文件名）→ 预览 → 数字行
+//  → 主轨道 → 概览条 → 阈值行 → 状态行 → 两排工具栏（7 键 + ✕ − +）。
+//  与 ck v2.0 的差异只有一处：导出入口放在导航栏右上角（ck 的导出在主编辑页，
+//  bk波剪是单素材独立 App，波剪页就是全部工作台，导出必须有地方放）。
+//
+//  【本页承担什么】
+//  波形可视化 + 自动检测 + 手动微调 + 撤销重做 + 播放校对 + 导出。
+//
+//  【数据流】
+//  asset → BKAudioAnalyzer 提取包络 → BKDetector 出切点
+//        → BKTimeline.build 合成 marks → 轨道画出来
+//  手动拖红区边缘 / 点片段 → 改 cuts → pushUndo 入撤销栈 → 重画
 //
 //  【时间轴口径】cuts 永远是**源时间**的删除区间，marks 由它派生。
 //  主轨道、概览条、导出全部吃同一份 cuts，单一真源，不存在换算错位。
 //
-//  【只做第一阶段】红区折叠（redFolded）这一版不启用 —— bk波剪是单素材纯波形，
-//  气口就地标红、点选反选、拖边缘调大小就够。BKTrackView 的 phase-2 长按编辑态
-//  在 redFolded=false 时被手势仲裁关掉，那几个 delegate 方法留空实现即可。
+//  【两个播放键】
+//  ▶ 原片播（红区绿区都播） ｜ `|▶|` 联播（按 keeps 拼起来播，跳过红区）
+//  两者起点都是指针那一帧（指针在红区时联播跳到下一个绿区），互斥。
+//  停止一律**停在原地**（ck 定稿 4.5.2）。
+//
+//  ✗✗ 键在单素材版里的语义 = 「清空全部红区」（ck 里它是「删红折叠进第二阶段」，
+//  bk波剪没有第二阶段，cuts 就是最终删除区间，所以等价动作是全部恢复）。
+//  ✕ 键 = 放弃这条视频返回选择页（ck 里它是「从批次移除」，单素材版等价于退出）。
+//
+//  【指针居中带来的一个连锁变化】
+//  指针不动、内容滚，所以「预览画面跟指针跳帧」变成了：
+//  滚动回调 → seek 播放器。预览画面本身不需要任何动效代码。
 //
 
 import UIKit
 import AVFoundation
 
 final class BKEditorViewController: UIViewController {
+
+    // MARK: - 播放模式
+
+    private enum PlayMode {
+        case idle
+        /// ▶ 原片播
+        case straight
+        /// `|▶|` 联播（拼起来的成品）
+        case joint
+    }
+
+    /// 撤销栈快照：cuts + 显示接缝。
+    /// 阈值重检也会先把旧状态压栈，手调过的刀口能靠撤销找回来
+    private struct EditState {
+        var cuts: [(Double, Double)]
+        var splits: [Double]
+    }
 
     // MARK: - 数据
 
@@ -35,42 +66,62 @@ final class BKEditorViewController: UIViewController {
     private var cuts: [(Double, Double)] = []
     /// 由 cuts 派生的完整覆盖序列，喂给主轨道/概览条显示
     private var marks: [BKMark] = []
+    /// 纯显示接缝（✂ 加的分割线，不改数据，ck Q3 拍板）
+    private var splits: [Double] = []
 
     /// 当前阈值 dB。滑块拖动即按它重检
     private var thresholdDb: Double = -35
     /// 自动检测算出的阈值，给「恢复自动」用
-    private var autoThresholdDb: Double = -35
+    private var autoThresholdDb: Double?
     /// 素材是否适用静音检测（带 BGM/响度归一化的判不适用）
     private var applicable = true
-    private var notApplicableReason: String?
 
-    /// 撤销栈：每次改动前压一份 cuts 快照
-    private var undoStack: [[(Double, Double)]] = []
+    /// 撤销 / 重做栈
+    private var undoStack: [EditState] = []
+    private var redoStack: [EditState] = []
 
     // MARK: - 播放
 
     private let player = AVPlayer()
     private let playerLayer = AVPlayerLayer()
     private var timeObserver: Any?
-    private var isPlaying = false
-    /// 是否在播「剪后」composition（此时指针不同步主轨道）
-    private var playingCut = false
+    private var playMode: PlayMode = .idle
+    /// 原片的 item 常驻；联播时临时换成 composition 的 item，停了再换回来
+    private var originalItem: AVPlayerItem?
+    private var jointBuild: BKCompositionBuild?
+    /// 阈值滑杆的防抖（停 0.4 秒才真正重算）
+    private var sliderWork: DispatchWorkItem?
+
+    private var lastTime: Double = 0
 
     // MARK: - 视图
 
-    private let previewView = UIView()
-    private let playButton = UIButton(type: .system)
+    private let previewContainer = UIView()
+    private let trackContainer = UIView()
     private let trackView = BKTrackView(frame: .zero)
     private let overviewBar = BKOverviewBar(frame: .zero)
-    private let thresholdLabel = UILabel()
+
+    // 工具栏第一排：撤销 / 重做 / 联播 / 播放 / 清红 / 切割 / 检测
+    private let undoButton = UIButton(type: .system)
+    private let redoButton = UIButton(type: .system)
+    private let jointButton = UIButton(type: .system)
+    private let playButton = UIButton(type: .system)
+    private let deleteRedButton = UIButton(type: .system)
+    private let cutButton = UIButton(type: .system)
+    private let detectButton = UIButton(type: .system)
+
+    // 工具栏第二排：✕（放弃本条，红色圆）在 − + 左边
+    private let removeButton = UIButton(type: .system)
+    private let zoomOutButton = UIButton(type: .system)
+    private let zoomInButton = UIButton(type: .system)
+
+    private let thresholdTitle = UILabel()
     private let thresholdSlider = UISlider()
-    private let autoButton = UIButton(type: .system)
-    private let bottomBar = UIView()
-    private let cutPreviewButton = UIButton(type: .system)
-    private let exportButton = UIButton(type: .system)
+    private let thresholdAutoButton = UIButton(type: .system)
+    private let timeLabel = UILabel()
+    private let infoLabel = UILabel()
     private let statusLabel = UILabel()
-    private let activity = UIActivityIndicatorView(style: .large)
-    private let undoButton = UIBarButtonItem()
+    private let spinner = UIActivityIndicatorView(style: .medium)
 
     // MARK: - 初始化
 
@@ -86,23 +137,30 @@ final class BKEditorViewController: UIViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = BKTheme.Color.page
-        title = BKVideoLibrary.assetName(localID: localID)
+        setupNav()
         setupAudio()
-        setupUI()
         setupPlayer()
+        setupUI()
         loadMaterial()
+    }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        // 边缘右滑返回和「拖红区边缘」是死敌：手指从屏幕左缘起手往右拖，
+        // 系统会当成返回手势，整个编辑页跟着滑走。剪辑页一律用左上角按钮返回
+        navigationController?.interactivePopGestureRecognizer?.isEnabled = false
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        navigationController?.interactivePopGestureRecognizer?.isEnabled = true
+        stopPlayback()
     }
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         // AVPlayerLayer 不吃 Auto Layout，手动给 frame
-        playerLayer.frame = previewView.bounds
-    }
-
-    override func viewWillDisappear(_ animated: Bool) {
-        super.viewWillDisappear(animated)
-        player.pause()
-        isPlaying = false
+        playerLayer.frame = previewContainer.bounds
     }
 
     deinit {
@@ -122,45 +180,137 @@ final class BKEditorViewController: UIViewController {
         }
     }
 
+    // MARK: - 导航栏
+
+    private func setupNav() {
+        navigationItem.title = BKVideoLibrary.assetName(localID: localID)
+
+        // 左上角返回（关闭）
+        let backItem = UIBarButtonItem(image: UIImage(systemName: "chevron.backward"),
+                                       style: .plain,
+                                       target: self,
+                                       action: #selector(closeTapped))
+        backItem.accessibilityLabel = "返回选择页"
+
+        // ☰ 素材清单：bk波剪一次只有一条素材，按键置灰保留布局（与 ck 单块素材时一致）
+        let listItem = UIBarButtonItem(image: UIImage(systemName: "line.3.horizontal"),
+                                       style: .plain,
+                                       target: nil,
+                                       action: nil)
+        listItem.isEnabled = false
+        listItem.accessibilityLabel = "单素材版无素材列表"
+        navigationItem.leftBarButtonItems = [backItem, listItem]
+
+        // 导出放导航栏右上角（ck 的导出在主编辑页；本 App 波剪页就是全部工作台）
+        let exportItem = UIBarButtonItem(title: "导出",
+                                         style: .plain,
+                                         target: self,
+                                         action: #selector(exportTapped))
+        exportItem.tintColor = BKTheme.Color.accent
+        navigationItem.rightBarButtonItem = exportItem
+    }
+
+    // MARK: - 播放器
+
+    private func setupPlayer() {
+        player.automaticallyWaitsToMinimizeStalling = false
+        playerLayer.videoGravity = .resizeAspect
+        playerLayer.player = player
+
+        // 0.033 ≈ 30fps。滚动是连续画面，20fps 会明显一格一格地跳
+        let interval = CMTime(seconds: 0.033, preferredTimescale: 600)
+        timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] t in
+            guard let self = self else { return }
+            let sec = CMTimeGetSeconds(t)
+            switch self.playMode {
+            case .idle:
+                break
+            case .straight:
+                self.syncPlayhead(to: sec)
+            case .joint:
+                guard let j = self.jointBuild else { return }
+                if sec >= j.total - 0.02 {
+                    self.stopPlayback()
+                } else {
+                    // 成品时间 → 反查原片时间，指针在原片轴上连贯前进，遇红区「跨」过去
+                    self.syncPlayhead(to: BKCompositionBuilder.sourceTime(j, outputTime: sec))
+                }
+            }
+        }
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(playbackEnded),
+            name: .AVPlayerItemDidPlayToEndTime, object: nil)
+    }
+
+    @objc private func playbackEnded() {
+        stopPlayback()
+    }
+
+    /// 播放回调 / 手动 seek 之后统一走这里：
+    /// 时间码、指针、概览条视窗框三处必须同时跟上，漏一处就会看到「画面和框对不上」
+    private func syncPlayhead(to t: Double) {
+        guard total > 0 else { return }
+        let clamped = min(max(t, 0), total)
+        lastTime = clamped
+        timeLabel.text = "\(formatClock(clamped)) / \(formatClock(total))"
+        trackView.setPointerTime(clamped)
+        overviewBar.setViewport(trackView.viewport)
+    }
+
     // MARK: - UI
 
     private func setupUI() {
-        // 预览区
-        previewView.backgroundColor = BKTheme.Color.preview
-        previewView.clipsToBounds = true
-        view.addSubview(previewView)
-        playerLayer.videoGravity = .resizeAspect
-        playerLayer.player = player
-        previewView.layer.addSublayer(playerLayer)
+        // ---- 预览画面：固定高度框，横竖屏都 letterbox 进这个区域 ----
+        let previewH = BKConfig.Layout.previewFixedH
+        let trackH = BKConfig.Layout.trackFixedH
 
-        playButton.setImage(UIImage(systemName: "play.fill"), for: .normal)
-        playButton.tintColor = .white
-        playButton.backgroundColor = UIColor(hex: 0x000000, alpha: 0.35)
-        playButton.layer.cornerRadius = 28
-        playButton.addTarget(self, action: #selector(playTapped), for: .touchUpInside)
-        previewView.addSubview(playButton)
+        previewContainer.backgroundColor = BKTheme.Color.preview
+        previewContainer.layer.cornerRadius = BKTheme.Radius.card
+        previewContainer.clipsToBounds = true
+        previewContainer.layer.addSublayer(playerLayer)
 
-        // 主轨道
+        trackContainer.backgroundColor = BKTheme.Color.page
+        trackContainer.layer.cornerRadius = BKTheme.Radius.card
+        trackContainer.clipsToBounds = true
         trackView.delegate = self
         trackView.allowsSiblingSwitch = false   // 单素材，禁用越界换片
-        view.addSubview(trackView)
+        trackContainer.addSubview(trackView)
+        trackView.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            trackView.leadingAnchor.constraint(equalTo: trackContainer.leadingAnchor),
+            trackView.trailingAnchor.constraint(equalTo: trackContainer.trailingAnchor),
+            trackView.topAnchor.constraint(equalTo: trackContainer.topAnchor),
+            trackView.bottomAnchor.constraint(equalTo: trackContainer.bottomAnchor)
+        ])
 
-        // 概览条
         overviewBar.delegate = self
-        view.addSubview(overviewBar)
 
-        // 阈值行
-        let thresholdTitle = UILabel()
-        thresholdTitle.text = "阈值"
-        thresholdTitle.font = BKTheme.Font.caption
-        thresholdTitle.textColor = BKTheme.Color.text2
-        thresholdTitle.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(thresholdTitle)
+        // ---- 数字行：紧贴画面下面 ----
+        timeLabel.font = BKTheme.Font.monoBig
+        timeLabel.textColor = BKTheme.Color.text
+        timeLabel.text = "00:00 / 00:00"
+        timeLabel.setContentHuggingPriority(.required, for: .horizontal)
+        timeLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
 
-        thresholdLabel.font = BKTheme.Font.mono
-        thresholdLabel.textColor = BKTheme.Color.warning
-        thresholdLabel.text = "-35.0 dB"
-        view.addSubview(thresholdLabel)
+        infoLabel.font = BKTheme.Font.monoSmall
+        infoLabel.textColor = BKTheme.Color.text2
+        infoLabel.numberOfLines = 2
+        infoLabel.textAlignment = .right
+        infoLabel.text = ""
+
+        let statsSpacer = UIView()
+        let statsRow = UIStackView(arrangedSubviews: [timeLabel, statsSpacer, infoLabel])
+        statsRow.axis = .horizontal
+        statsRow.spacing = BKTheme.Space.md
+        statsRow.alignment = .center
+        // 时间码数字行必须完整显示：竖直方向设为最高抗压
+        statsRow.setContentCompressionResistancePriority(.required, for: .vertical)
+
+        // ---- 阈值行 + 恢复自动按钮 ----
+        thresholdTitle.font = BKTheme.Font.mono
+        thresholdTitle.textColor = BKTheme.Color.text
+        thresholdTitle.setContentHuggingPriority(.required, for: .horizontal)
+        thresholdTitle.text = String(format: "阈值 %.1f dB", thresholdDb)
 
         thresholdSlider.minimumValue = Float(BKConfig.Detect.clampLow)
         thresholdSlider.maximumValue = Float(BKConfig.Detect.clampHigh)
@@ -168,163 +318,234 @@ final class BKEditorViewController: UIViewController {
         thresholdSlider.minimumTrackTintColor = BKTheme.Color.warning
         thresholdSlider.maximumTrackTintColor = BKTheme.Color.line
         thresholdSlider.addTarget(self, action: #selector(thresholdChanged), for: .valueChanged)
-        view.addSubview(thresholdSlider)
 
-        autoButton.setImage(BKIcons.backToAuto(side: 20), for: .normal)
-        autoButton.tintColor = BKTheme.Color.text2
-        autoButton.addTarget(self, action: #selector(backToAutoTapped), for: .touchUpInside)
-        view.addSubview(autoButton)
-
-        // 状态/提示
-        statusLabel.font = BKTheme.Font.caption
-        statusLabel.textColor = BKTheme.Color.text3
-        statusLabel.numberOfLines = 0
-        statusLabel.textAlignment = .center
-        view.addSubview(statusLabel)
-
-        // 底部操作条
-        bottomBar.backgroundColor = BKTheme.Color.bar
-        bottomBar.layer.borderWidth = 1
-        bottomBar.layer.borderColor = BKTheme.Color.line.cgColor
-        view.addSubview(bottomBar)
-
-        cutPreviewButton.setTitle("试听剪后", for: .normal)
-        cutPreviewButton.titleLabel?.font = BKTheme.Font.button
-        cutPreviewButton.tintColor = BKTheme.Color.text
-        cutPreviewButton.addTarget(self, action: #selector(cutPreviewTapped), for: .touchUpInside)
-        bottomBar.addSubview(cutPreviewButton)
-
-        exportButton.setTitle("导出", for: .normal)
-        exportButton.titleLabel?.font = BKTheme.Font.button
-        exportButton.tintColor = .white
-        exportButton.backgroundColor = BKTheme.Color.accent
-        exportButton.layer.cornerRadius = BKTheme.Button.radius
-        exportButton.addTarget(self, action: #selector(exportTapped), for: .touchUpInside)
-        bottomBar.addSubview(exportButton)
-
-        // 加载指示
-        activity.color = BKTheme.Color.text
-        activity.hidesWhenStopped = true
-        activity.startAnimating()
-        view.addSubview(activity)
-
-        // 撤销按钮
-        undoButton.title = "撤销"
-        undoButton.target = self
-        undoButton.action = #selector(undoTapped)
-        undoButton.isEnabled = false
-        navigationItem.rightBarButtonItem = undoButton
-
-        // 布局
-        for v in [previewView, trackView, overviewBar, thresholdLabel, thresholdSlider,
-                  autoButton, statusLabel, bottomBar, activity, playButton,
-                  cutPreviewButton, exportButton] {
-            v.translatesAutoresizingMaskIntoConstraints = false
-        }
-        let previewH = BKConfig.Layout.previewFixedH
-        let trackH = BKConfig.Layout.trackFixedH
-        let ovH: CGFloat = 36
-        let bottomH: CGFloat = 56
+        thresholdAutoButton.setImage(BKIcons.backToAuto(side: 20), for: .normal)
+        thresholdAutoButton.tintColor = BKTheme.Color.text
+        thresholdAutoButton.addTarget(self, action: #selector(thresholdAutoTapped), for: .touchUpInside)
         NSLayoutConstraint.activate([
-            previewView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-            previewView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            previewView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            previewView.heightAnchor.constraint(equalToConstant: previewH),
+            thresholdAutoButton.widthAnchor.constraint(equalToConstant: 24),
+            thresholdAutoButton.heightAnchor.constraint(equalToConstant: 24)
+        ])
 
-            playButton.centerXAnchor.constraint(equalTo: previewView.centerXAnchor),
-            playButton.centerYAnchor.constraint(equalTo: previewView.centerYAnchor),
-            playButton.widthAnchor.constraint(equalToConstant: 56),
-            playButton.heightAnchor.constraint(equalToConstant: 56),
+        let thresholdRow = UIStackView(arrangedSubviews: [thresholdTitle, thresholdSlider, thresholdAutoButton])
+        thresholdRow.axis = .horizontal
+        thresholdRow.spacing = BKTheme.Space.sm
+        thresholdRow.alignment = .center
 
-            trackView.topAnchor.constraint(equalTo: previewView.bottomAnchor, constant: BKTheme.Space.sm),
-            trackView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            trackView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            trackView.heightAnchor.constraint(equalToConstant: trackH),
+        statusLabel.font = BKTheme.Font.caption
+        statusLabel.textColor = BKTheme.Color.warning
+        statusLabel.numberOfLines = 0
 
-            overviewBar.topAnchor.constraint(equalTo: trackView.bottomAnchor, constant: BKTheme.Space.sm),
-            overviewBar.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: BKTheme.Space.md),
-            overviewBar.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -BKTheme.Space.md),
-            overviewBar.heightAnchor.constraint(equalToConstant: ovH),
+        spinner.hidesWhenStopped = true
+        spinner.color = BKTheme.Color.accent
 
-            thresholdTitle.topAnchor.constraint(equalTo: overviewBar.bottomAnchor, constant: BKTheme.Space.md),
-            thresholdTitle.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: BKTheme.Space.md),
-            thresholdTitle.centerYAnchor.constraint(equalTo: thresholdSlider.centerYAnchor),
+        // 提示文案贴在工具栏正上方，独立于内容栈：
+        // 无论上方内容多高，提示区永远不会被底部工具栏遮住（小屏最容易触发遮挡）
+        let statusBar = UIStackView(arrangedSubviews: [statusLabel, spinner])
+        statusBar.axis = .horizontal
+        statusBar.spacing = BKTheme.Space.sm
+        statusBar.alignment = .center
 
-            thresholdSlider.topAnchor.constraint(equalTo: overviewBar.bottomAnchor, constant: BKTheme.Space.md),
-            thresholdSlider.leadingAnchor.constraint(equalTo: thresholdTitle.trailingAnchor, constant: BKTheme.Space.sm),
-            thresholdSlider.trailingAnchor.constraint(equalTo: autoButton.leadingAnchor, constant: -BKTheme.Space.sm),
+        // 顺序：画面 → 数字行 → 主轨道 → 概览 → 阈值
+        let filler = UIView()
+        let stack = UIStackView(arrangedSubviews: [
+            previewContainer, statsRow, trackContainer, overviewBar, thresholdRow, filler
+        ])
+        stack.axis = .vertical
+        stack.spacing = BKTheme.Space.sm
+        stack.alignment = .fill
 
-            autoButton.centerYAnchor.constraint(equalTo: thresholdSlider.centerYAnchor),
-            autoButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -BKTheme.Space.md),
-            autoButton.widthAnchor.constraint(equalToConstant: 32),
-            autoButton.heightAnchor.constraint(equalToConstant: 32),
+        let toolbar = makeToolbar()
 
-            statusLabel.topAnchor.constraint(equalTo: thresholdSlider.bottomAnchor, constant: BKTheme.Space.xs),
-            statusLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: BKTheme.Space.md),
-            statusLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -BKTheme.Space.md),
+        view.addSubview(stack)
+        view.addSubview(toolbar)
+        view.addSubview(statusBar)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        toolbar.translatesAutoresizingMaskIntoConstraints = false
+        statusBar.translatesAutoresizingMaskIntoConstraints = false
+        statusLabel.setContentCompressionResistancePriority(.required, for: .vertical)
+        // 小屏竖向预算不够时宁可让内容栈向下溢出、也不能把提示文字压扁
+        statusLabel.backgroundColor = BKTheme.Color.page
+        statusBar.backgroundColor = BKTheme.Color.page
 
-            bottomBar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            bottomBar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            bottomBar.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
-            bottomBar.heightAnchor.constraint(equalToConstant: bottomH),
+        // 内容栈底 ≤ 状态栏顶，优先级 999（全场最低，约束打架时第一个断它）
+        let stackUnderStatus = stack.bottomAnchor.constraint(
+            lessThanOrEqualTo: statusBar.topAnchor, constant: -BKTheme.Space.md)
+        stackUnderStatus.priority = UILayoutPriority(999)
 
-            cutPreviewButton.leadingAnchor.constraint(equalTo: bottomBar.leadingAnchor, constant: BKTheme.Space.md),
-            cutPreviewButton.centerYAnchor.constraint(equalTo: bottomBar.centerYAnchor),
-            cutPreviewButton.widthAnchor.constraint(equalToConstant: 100),
-            cutPreviewButton.heightAnchor.constraint(equalToConstant: 40),
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: BKTheme.Space.lg),
+            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -BKTheme.Space.lg),
+            stack.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: BKTheme.Space.sm),
+            stackUnderStatus,
 
-            exportButton.leadingAnchor.constraint(equalTo: cutPreviewButton.trailingAnchor, constant: BKTheme.Space.sm),
-            exportButton.trailingAnchor.constraint(equalTo: bottomBar.trailingAnchor, constant: -BKTheme.Space.md),
-            exportButton.centerYAnchor.constraint(equalTo: bottomBar.centerYAnchor),
-            exportButton.heightAnchor.constraint(equalToConstant: 40),
+            statusBar.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: BKTheme.Space.lg),
+            statusBar.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -BKTheme.Space.lg),
+            statusBar.bottomAnchor.constraint(equalTo: toolbar.topAnchor, constant: -BKTheme.Space.md),
 
-            activity.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            activity.centerYAnchor.constraint(equalTo: view.centerYAnchor)
+            previewContainer.heightAnchor.constraint(equalToConstant: previewH),
+            trackContainer.heightAnchor.constraint(equalToConstant: trackH),
+            overviewBar.heightAnchor.constraint(equalToConstant: 30),
+
+            toolbar.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: BKTheme.Space.lg),
+            toolbar.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -BKTheme.Space.lg),
+            toolbar.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+            toolbar.heightAnchor.constraint(equalToConstant: 100)
+        ])
+
+        updateThresholdAutoButton()
+        updateUndoButtons()
+    }
+
+    /// 工具栏两排：
+    /// 第一排 7 个圆钮：`↩ ↪ |▶| ▶ ✗✗ ✂ 💉`
+    /// 第二排 `✕ − +` 三个小圆靠右 —— ✕ 放弃本条；− + 是捏合失灵时的缩放保底
+    private func makeToolbar() -> UIStackView {
+        configureTool(undoButton, systemName: "arrow.uturn.backward", action: #selector(undoTapped))
+        configureTool(redoButton, systemName: "arrow.uturn.forward", action: #selector(redoTapped))
+
+        // 联播键 `|▶|`
+        jointButton.setImage(BKIcons.skip(), for: .normal)
+        applyToolStyle(jointButton, action: #selector(jointTapped))
+        // 播放 / 停止是同一个键
+        configureTool(playButton, systemName: "play.fill", action: #selector(playTapped))
+
+        // ✗✗ 清空全部红区（自定义纯红双 X，非模板图）
+        deleteRedButton.setImage(BKIcons.deleteRedDoubleX(), for: .normal)
+        applyToolStyle(deleteRedButton, action: #selector(deleteRedTapped))
+        configureTool(cutButton, systemName: "scissors", action: #selector(cutTapped))
+        configureTool(detectButton, systemName: "eyedropper", action: #selector(detectTapped))
+
+        let row1 = UIStackView(arrangedSubviews: [
+            undoButton, redoButton, jointButton, playButton, deleteRedButton, cutButton, detectButton
+        ])
+        row1.axis = .horizontal
+        row1.spacing = BKTheme.Space.sm
+        row1.alignment = .center
+        // 均分可用宽度：7 个按钮在任何屏宽下都平分 row1 内部空间，永不溢出挤压
+        row1.distribution = .fillEqually
+        // 组间 16 = 默认 8 再补 8（撤销重做一组 | 播放联播一组 | 后三个编辑键一组）
+        row1.setCustomSpacing(BKTheme.Space.lg, after: redoButton)
+        row1.setCustomSpacing(BKTheme.Space.lg, after: playButton)
+
+        styleRemoveStep(removeButton, action: #selector(removeTapped))
+        zoomOutButton.setImage(UIImage(systemName: "minus"), for: .normal)
+        styleZoomStep(zoomOutButton, action: #selector(zoomOutTapped))
+        zoomInButton.setImage(UIImage(systemName: "plus"), for: .normal)
+        styleZoomStep(zoomInButton, action: #selector(zoomInTapped))
+
+        let spacer2 = UIView()
+        let row2 = UIStackView(arrangedSubviews: [spacer2, removeButton, zoomOutButton, zoomInButton])
+        row2.axis = .horizontal
+        row2.spacing = BKTheme.Space.sm
+        row2.alignment = .center
+
+        let toolbar = UIStackView(arrangedSubviews: [row1, row2])
+        toolbar.axis = .vertical
+        toolbar.spacing = BKTheme.Space.sm
+        toolbar.alignment = .fill
+        // 不要灰色底框：按钮直接贴内容区左右边(16pt)，更紧凑。
+        // 底色用页面色而非透明：小屏内容栈溢出时穿过工具栏区，页面色能把它盖住
+        toolbar.backgroundColor = BKTheme.Color.page
+        return toolbar
+    }
+
+    private func configureTool(_ button: UIButton, systemName: String, action: Selector) {
+        let cfg = UIImage.SymbolConfiguration(pointSize: BKTheme.Button.iconPoint, weight: .regular)
+        button.setImage(UIImage(systemName: systemName, withConfiguration: cfg), for: .normal)
+        applyToolStyle(button, action: action)
+    }
+
+    /// 只套皮 + 挂 action，不动图。自定义图标（联播 `|▶|`、✗✗）用这个入口
+    private func applyToolStyle(_ button: UIButton, action: Selector) {
+        button.tintColor = BKTheme.Color.text
+        button.backgroundColor = BKTheme.Color.panel
+        button.layer.cornerRadius = BKTheme.Button.radius
+        button.layer.borderWidth = BKTheme.Button.border
+        button.layer.borderColor = BKTheme.Color.line.cgColor
+        button.clipsToBounds = true
+        button.addTarget(self, action: action, for: .touchUpInside)
+        // 正方形靠「高 = 宽」保持正圆；宽度不写死，交给 row1 的 fillEqually 按可用宽度均分。
+        // 这样 7 个按钮在 15 PM(430pt) 上仍是 44pt，在 16/16 Pro(390/402pt) 上自动缩到
+        // 约 38/40pt，不会被 UIStackView 挤成一团。
+        NSLayoutConstraint.activate([
+            button.heightAnchor.constraint(equalTo: button.widthAnchor)
         ])
     }
 
-    private func setupPlayer() {
-        playerLayer.videoGravity = .resizeAspect
-        let interval = CMTime(seconds: 0.05, preferredTimescale: 600)
-        timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] t in
-            guard let self = self else { return }
-            // 剪后预览时间轴与源时间不一致，不驱动主轨道指针
-            guard !self.playingCut else { return }
-            let sec = CMTimeGetSeconds(t)
-            if self.isPlaying {
-                self.trackView.setPointerTime(sec)
-            } else {
-                self.isPlaying = false
-            }
-            self.syncPlayIcon()
-        }
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(playbackEnded),
-            name: .AVPlayerItemDidPlayToEndTime, object: nil)
+    private func styleZoomStep(_ button: UIButton, action: Selector) {
+        button.tintColor = BKTheme.Color.text2
+        button.backgroundColor = BKTheme.Color.panel
+        button.layer.cornerRadius = 14
+        button.layer.borderWidth = BKTheme.Button.border
+        button.layer.borderColor = BKTheme.Color.line.cgColor
+        button.clipsToBounds = true
+        button.addTarget(self, action: action, for: .touchUpInside)
+        NSLayoutConstraint.activate([
+            button.widthAnchor.constraint(equalToConstant: 28),
+            button.heightAnchor.constraint(equalToConstant: 28)
+        ])
+    }
+
+    /// ✕ 按钮：红色实心圆 + 白叉，一眼认出是「危险操作」。点下去**先弹确认框**，不直接退
+    private func styleRemoveStep(_ button: UIButton, action: Selector) {
+        let cfg = UIImage.SymbolConfiguration(pointSize: 14, weight: .bold)
+        button.setImage(UIImage(systemName: "xmark", withConfiguration: cfg), for: .normal)
+        button.tintColor = .white
+        button.backgroundColor = BKTheme.Color.danger
+        button.layer.cornerRadius = 14
+        button.clipsToBounds = true
+        button.addTarget(self, action: action, for: .touchUpInside)
+        NSLayoutConstraint.activate([
+            button.widthAnchor.constraint(equalToConstant: 28),
+            button.heightAnchor.constraint(equalToConstant: 28)
+        ])
+    }
+
+    /// 播放键图标 + 联播键高亮，两处一起收在这里，免得改了形状忘了另一处
+    private func updatePlayIcons() {
+        let cfg = UIImage.SymbolConfiguration(pointSize: BKTheme.Button.iconPoint, weight: .regular)
+        playButton.setImage(UIImage(systemName: playMode == .straight ? "stop.fill" : "play.fill",
+                                    withConfiguration: cfg), for: .normal)
+        jointButton.backgroundColor = (playMode == .joint)
+            ? BKTheme.Color.selectBg
+            : BKTheme.Color.panel
     }
 
     // MARK: - 加载素材
 
     private func loadMaterial() {
+        spinner.startAnimating()
+        setControlsEnabled(false)
+        statusLabel.text = "正在提取音频波形…"
         BKVideoLibrary.loadAVAsset(localID: localID) { [weak self] asset in
             guard let self = self else { return }
             guard let asset = asset else {
                 DispatchQueue.main.async {
-                    self.activity.stopAnimating()
+                    self.spinner.stopAnimating()
                     self.statusLabel.text = "视频加载失败（可能还在 iCloud 上，联网重试一次）"
                 }
                 return
             }
             self.asset = asset
+            DispatchQueue.main.async {
+                // 原片 item 常驻；联播只临时换 item，绝不重建 AVPlayer
+                let item = AVPlayerItem(asset: asset)
+                self.originalItem = item
+                self.player.replaceCurrentItem(with: item)
+            }
             BKAudioAnalyzer.extractEnvelope(from: asset) { [weak self] result in
                 guard let self = self else { return }
                 DispatchQueue.main.async {
-                    self.activity.stopAnimating()
+                    self.spinner.stopAnimating()
                     switch result {
                     case .success(let env):
                         self.envelope = env
                         self.total = env.duration
-                        self.runDetect(override: nil)
+                        self.lastTime = 0
+                        self.timeLabel.text = "\(self.formatClock(0)) / \(self.formatClock(self.total))"
+                        self.setControlsEnabled(true)
+                        self.runDetection(override: nil)
                     case .failure(let err):
                         self.statusLabel.text = "包络提取失败：\(err.localizedDescription)"
                     }
@@ -333,32 +554,175 @@ final class BKEditorViewController: UIViewController {
         }
     }
 
-    // MARK: - 检测 / 刷新
+    // MARK: - 检测
 
-    /// 跑一次检测（override=nil 走 Otsu 自动）。结果写进 cuts，刷新双视图
-    private func runDetect(override: Double?) {
+    /// 跑一次检测（override=nil 走 Otsu 自动）。
+    /// recordUndo=true 时先把当前刀口压进撤销栈 —— 阈值重检会整体重算 cuts，
+    /// 手动调过的边界要能靠撤销找回来
+    private func runDetection(override: Double?, recordUndo: Bool = false) {
         guard let env = envelope, total > 0 else { return }
-        let out = BKDetector.detect(envelope: env, totalDuration: total, overrideThreshold: override)
-        applicable = out.info.applicable
-        notApplicableReason = out.info.reason
-        thresholdDb = out.info.thresholdDb
-        autoThresholdDb = out.info.thresholdDb
-        cuts = out.cuts
-        marks = BKTimeline.build(duration: total, cuts: cuts)
-        thresholdSlider.value = Float(thresholdDb)
-        thresholdLabel.text = String(format: "%.1f dB", thresholdDb)
+        statusLabel.text = "正在检测气口…"
+        spinner.startAnimating()
 
-        if !applicable {
-            statusLabel.text = notApplicableReason ?? "该素材不适用静音检测"
-            statusLabel.textColor = BKTheme.Color.warning
-        } else {
-            statusLabel.text = String(format: "自动找到 %d 处气口 · 拖动阈值可增删", out.info.adoptedCount)
-            statusLabel.textColor = BKTheme.Color.text3
+        let dur = total
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let outcome = BKDetector.detect(envelope: env,
+                                            totalDuration: dur,
+                                            overrideThreshold: override)
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.spinner.stopAnimating()
+                if recordUndo { self.pushUndo() }
+                self.cuts = outcome.cuts
+                self.marks = BKTimeline.build(duration: dur, cuts: self.cuts)
+                self.thresholdDb = outcome.info.thresholdDb
+                if override == nil {
+                    // 记下这次自动算出来的**实际使用值**（夹逼之后的）——
+                    // 「恢复自动」要回到的就是它，不是未夹逼的原始 Otsu
+                    self.autoThresholdDb = outcome.info.thresholdDb
+                }
+                self.applicable = outcome.info.applicable
+
+                // 程序设值不触发 valueChanged，不会造成重入
+                self.thresholdSlider.value = Float(outcome.info.thresholdDb)
+                self.thresholdTitle.text = String(format: "阈值 %.1f dB", outcome.info.thresholdDb)
+
+                if !self.applicable {
+                    self.statusLabel.text = outcome.info.reason ?? "该素材不适用静音检测"
+                } else {
+                    self.statusLabel.text = String(format: "自动找到 %d 处气口 · 拖动阈值可增删",
+                                                   outcome.info.adoptedCount)
+                }
+                self.detectButton.isEnabled = self.applicable
+                self.detectButton.alpha = self.applicable ? 1.0 : 0.35
+
+                self.refreshTrack()
+                self.updateInfo()
+                self.updateUndoButtons()
+                self.updateThresholdAutoButton()
+            }
         }
+    }
+
+    /// 轨道 + 概览条一起刷新。分开刷迟早会出现「轨道已经切了，概览条还画着旧的」
+    private func refreshTrack() {
+        let pieces = BKTimeline.pieces(duration: total, cuts: cuts, splits: splits)
+        trackView.setContent(envelope: envelope, pieces: pieces, splits: splits,
+                             duration: total, thresholdDb: thresholdDb, redFolded: false)
+        overviewBar.setContent(envelope: envelope, pieces: pieces, duration: total,
+                               viewport: trackView.viewport)
+    }
+
+    private func updateInfo() {
+        let removed = cuts.reduce(0.0) { $0 + ($1.1 - $1.0) }
+        let outDur = max(0, total - removed)
+        if cuts.isEmpty {
+            infoLabel.text = String(format: "原 %@ · 剪后 %@ · 还没有刀口",
+                                    formatClock(total), formatClock(outDur))
+        } else {
+            let ratio = total > 0 ? removed / total : 0
+            infoLabel.text = String(format: "原 %@ · 剪后 %@ · %d 刀 · 删 %.1fs（%.1f%%）",
+                                    formatClock(total), formatClock(outDur),
+                                    cuts.count, removed, ratio * 100)
+        }
+    }
+
+    // MARK: - 撤销 / 重做
+
+    private func pushUndo() {
+        undoStack.append(EditState(cuts: cuts, splits: splits))
+        if undoStack.count > BKConfig.Draft.undoLimit { undoStack.removeFirst() }
+        redoStack.removeAll()
+        updateUndoButtons()
+    }
+
+    private func apply(_ s: EditState) {
+        cuts = s.cuts
+        splits = s.splits
+        marks = BKTimeline.build(duration: total, cuts: cuts)
         refreshTrack()
-        // 预览里也垫上原片，方便边看波形边听
-        if let a = asset, player.currentItem == nil {
-            player.replaceCurrentItem(with: AVPlayerItem(asset: a))
+        updateInfo()
+    }
+
+    @objc private func undoTapped() {
+        guard let prev = undoStack.popLast() else { return }
+        redoStack.append(EditState(cuts: cuts, splits: splits))
+        apply(prev)
+        updateUndoButtons()
+        statusLabel.text = "已撤销"
+    }
+
+    @objc private func redoTapped() {
+        guard let next = redoStack.popLast() else { return }
+        undoStack.append(EditState(cuts: cuts, splits: splits))
+        apply(next)
+        updateUndoButtons()
+        statusLabel.text = "已重做"
+    }
+
+    /// 撤销 / 重做按钮的可用性。灰掉比点了没反应好 ——
+    /// 点了没反应，用户会以为是 App 卡了
+    private func updateUndoButtons() {
+        undoButton.isEnabled = !undoStack.isEmpty
+        redoButton.isEnabled = !redoStack.isEmpty
+        undoButton.alpha = undoStack.isEmpty ? 0.35 : 1.0
+        redoButton.alpha = redoStack.isEmpty ? 0.35 : 1.0
+    }
+
+    // MARK: - 编辑操作
+
+    /// ✂ 把指针所在的地方切开。**切开 ≠ 删除**：切口不进 cuts，
+    /// 导出时长纹丝不动。作用是把一段划成两段，好让你单独处理其中一半
+    @objc private func cutTapped() {
+        let t = min(max(lastTime, 0), total)
+        guard t > 0.05, t < total - 0.05 else {
+            statusLabel.text = "指针太靠两头了，这里切不出东西"
+            return
+        }
+        guard !splits.contains(where: { abs($0 - t) < 0.05 }) else {
+            statusLabel.text = "这里已经有一道切口了"
+            return
+        }
+        pushUndo()
+        splits.append(t)
+        splits.sort()
+        statusLabel.text = String(format: "在 %.2fs 处加了一道分割线（仅显示）", t)
+        refreshTrack()
+    }
+
+    /// ✗✗ 清空全部红区（单素材版语义；ck 里它是「删红折叠」，本 App 无第二阶段）
+    @objc private func deleteRedTapped() {
+        guard !cuts.isEmpty else {
+            statusLabel.text = "当前没有红区可清"
+            return
+        }
+        pushUndo()
+        let n = cuts.count
+        cuts = []
+        marks = BKTimeline.build(duration: total, cuts: cuts)
+        refreshTrack()
+        updateInfo()
+        statusLabel.text = String(format: "已清空 %d 段红区 · 撤销可恢复", n)
+    }
+
+    /// 点段 toggle 绿↔红：「只能删红区、绿区想删先点成红」
+    private func togglePiece(at time: Double) {
+        guard let idx = marks.firstIndex(where: { time >= $0.start - 1e-9 && time <= $0.end + 1e-9 })
+        else {
+            statusLabel.text = "指针这儿没有片段"
+            return
+        }
+        let piece = marks[idx]
+        pushUndo()
+        let next = BKTimeline.toggle(marks: marks, at: idx)
+        cuts = cutsFromMarks(next)
+        marks = BKTimeline.build(duration: total, cuts: cuts)
+        refreshTrack()
+        updateInfo()
+        if piece.kind == .cut {
+            statusLabel.text = String(format: "恢复 %.2f~%.2fs", piece.start, piece.end)
+        } else {
+            statusLabel.text = String(format: "删掉 %.2f~%.2fs", piece.start, piece.end)
         }
     }
 
@@ -378,110 +742,166 @@ final class BKEditorViewController: UIViewController {
         return out
     }
 
-    /// 用当前 cuts 重画主轨道 + 概览条
-    private func refreshTrack() {
-        let pieces = BKTimeline.pieces(duration: total, cuts: cuts, splits: [])
-        trackView.setContent(envelope: envelope, pieces: pieces, splits: [],
-                             duration: total, thresholdDb: thresholdDb, redFolded: false)
-        overviewBar.setContent(envelope: envelope, pieces: pieces, duration: total,
-                               viewport: trackView.viewport)
+    // MARK: - ✕ 放弃本条返回选择页
+
+    @objc private func removeTapped() {
+        let name = BKVideoLibrary.assetName(localID: localID)
+        let alert = UIAlertController(title: "放弃这条视频？",
+                                      message: "「\(name)」的剪辑不会保留，返回后重新选。",
+                                      preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "取消", style: .cancel, handler: nil))
+        alert.addAction(UIAlertAction(title: "放弃", style: .destructive) { [weak self] _ in
+            self?.navigationController?.popViewController(animated: true)
+        })
+        present(alert, animated: true)
     }
 
-    // MARK: - 撤销
-
-    private func pushUndo() {
-        undoStack.append(cuts)
-        if undoStack.count > BKConfig.Draft.undoLimit { undoStack.removeFirst() }
-        undoButton.isEnabled = true
-    }
-
-    @objc private func undoTapped() {
-        guard let prev = undoStack.popLast() else { return }
-        cuts = prev
-        marks = BKTimeline.build(duration: total, cuts: cuts)
-        refreshTrack()
-        if undoStack.isEmpty { undoButton.isEnabled = false }
-    }
-
-    // MARK: - 动作
+    // MARK: - 阈值
 
     @objc private func thresholdChanged() {
-        thresholdDb = Double(thresholdSlider.value)
-        thresholdLabel.text = String(format: "%.1f dB", thresholdDb)
-        // 拖动即按该阈值重检（包络已在内存，很快）
-        runDetect(override: thresholdDb)
-        // 阈值重检等同重做，撤销栈清空
-        undoStack.removeAll()
-        undoButton.isEnabled = false
-    }
-
-    @objc private func backToAutoTapped() {
-        thresholdSlider.value = Float(autoThresholdDb)
-        runDetect(override: nil)
-        undoStack.removeAll()
-        undoButton.isEnabled = false
-    }
-
-    @objc private func playTapped() {
-        if isPlaying {
-            player.pause()
-            isPlaying = false
-        } else {
-            player.play()
-            isPlaying = true
+        let v = Double(thresholdSlider.value)
+        thresholdDb = v
+        thresholdTitle.text = String(format: "阈值 %.1f dB", v)
+        updateThresholdAutoButton()
+        // 滑杆是连续动作，停下 0.4 秒才真正重算 —— 手感优先
+        sliderWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.runDetection(override: v, recordUndo: true)
         }
-        syncPlayIcon()
+        sliderWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
     }
 
-    private func syncPlayIcon() {
-        let playing = player.timeControlStatus == .playing
-        isPlaying = playing
-        playButton.isHidden = playing
-    }
-
-    @objc private func playbackEnded() {
-        player.seek(to: .zero)
-        player.pause()
-        isPlaying = false
-        if playingCut {
-            // 剪后播完，回到原片待播状态
-            playingCut = false
-            if let a = asset { player.replaceCurrentItem(with: AVPlayerItem(asset: a)) }
-        }
-        playButton.isHidden = false
-    }
-
-    @objc private func cutPreviewTapped() {
-        guard let asset = asset else { return }
-        if playingCut {
-            // 退出剪后预览
-            playingCut = false
-            player.replaceCurrentItem(with: AVPlayerItem(asset: asset))
-            player.pause()
-            isPlaying = false
-            playButton.isHidden = false
-            cutPreviewButton.setTitle("试听剪后", for: .normal)
+    /// 「恢复自动」：当前就是自动值时置灰，手动拖过就亮，按一下回到 Otsu 的值并重算
+    @objc private func thresholdAutoTapped() {
+        guard let auto = autoThresholdDb else {
+            statusLabel.text = "还没有自动值，先等首次检测完成"
             return
         }
+        thresholdSlider.value = Float(auto)
+        thresholdTitle.text = String(format: "阈值 %.1f dB", auto)
+        thresholdDb = auto
+        runDetection(override: auto, recordUndo: true)
+        statusLabel.text = String(format: "已回到自动值 %.1f dB", auto)
+    }
+
+    /// 💉 按当前阈值重算气口
+    @objc private func detectTapped() {
+        runDetection(override: Double(thresholdSlider.value), recordUndo: true)
+    }
+
+    /// 阈值是不是还停在自动算出来的那个值上
+    private func updateThresholdAutoButton() {
+        guard let auto = autoThresholdDb else {
+            thresholdAutoButton.isEnabled = false
+            thresholdAutoButton.alpha = 0.30
+            return
+        }
+        let isAuto = abs(thresholdDb - auto) < 0.01
+        thresholdAutoButton.isEnabled = !isAuto
+        thresholdAutoButton.alpha = isAuto ? 0.30 : 1.0
+    }
+
+    // MARK: - 播放
+
+    /// ▶ 原片播：从指针处起播，红区绿区都播
+    @objc private func playTapped() {
+        if playMode == .straight { stopPlayback(); return }
+        stopPlayback()
+        guard originalItem != nil else { return }
+        player.play()
+        playMode = .straight
+        updatePlayIcons()
+    }
+
+    /// `|▶|` 联播：按保留段临时拼一条来播，等于预演成品
+    @objc private func jointTapped() {
+        if playMode == .joint { stopPlayback(); return }
+        stopPlayback()
+        guard let a = asset, total > 0 else { return }
+
         let keeps = BKDetector.keptSegments(cuts, totalSec: total)
-        guard let built = BKCompositionBuilder.make(asset: asset, keeps: keeps) else {
+        guard let built = BKCompositionBuilder.make(asset: a, keeps: keeps) else {
             statusLabel.text = "没有可保留的片段，先少删一点"
             return
         }
+        // 指针在绿区就从指针处播，指针在红区就跳下一个绿区
+        guard let startSrc = startKeptTime(for: lastTime, keeps: keeps) else {
+            statusLabel.text = "指针后面没有可播的片段了"
+            return
+        }
+        let startOut = outputTime(of: built, at: startSrc)
+
         let item = AVPlayerItem(asset: built.comp)
+        // 接缝淡入淡出挂在 item 上才生效（导出侧由 BKExporter 自己处理）
+        item.audioMix = BKCompositionBuilder.makeFadeMix(built)
+        jointBuild = built
         player.replaceCurrentItem(with: item)
-        playingCut = true
+        player.seek(to: CMTime(seconds: startOut, preferredTimescale: 600),
+                    toleranceBefore: .zero, toleranceAfter: .zero)
+        // 指针跟着挪到对应位置，跳转是瞬间的。
+        // ⚠️ 这里传的是**原片**时间 —— 主轨道画的是原片时间轴
+        syncPlayhead(to: startSrc)
+
         player.play()
-        isPlaying = true
-        playButton.isHidden = true
-        cutPreviewButton.setTitle("退出剪后", for: .normal)
+        playMode = .joint
+        updatePlayIcons()
     }
+
+    /// 指针在某个保留段里 → 从指针处起播；在红区 → 跳下一个保留段的开头
+    private func startKeptTime(for t: Double, keeps: [(Double, Double)]) -> Double? {
+        for k in keeps where t >= k.0 - 1e-9 && t <= k.1 + 1e-9 { return t }
+        for k in keeps where k.0 >= t - 1e-9 { return k.0 }
+        return nil
+    }
+
+    /// 原片时间 → 成品时间（BKCompositionBuilder 只给了反向的 sourceTime，这里就地反查）
+    private func outputTime(of build: BKCompositionBuild, at src: Double) -> Double {
+        for seg in build.table {
+            let srcEnd = seg.src + seg.dur * seg.speed
+            if src >= seg.src - 1e-9 && src <= srcEnd + 1e-9 {
+                return seg.out + (src - seg.src) / seg.speed
+            }
+        }
+        return build.table.first?.out ?? 0
+    }
+
+    /// 停止。**指针停原地** —— 旧版「停止 = 暂停 + 回 0 秒」已作废
+    private func stopPlayback() {
+        player.pause()
+        if playMode == .joint {
+            // 画面切回原片，并把播放位置挪回指针 —— 这样退出联播之后画面接得上
+            if let it = originalItem { player.replaceCurrentItem(with: it) }
+            jointBuild = nil
+        }
+        playMode = .idle
+        if total > 0 {
+            player.seek(to: CMTime(seconds: lastTime, preferredTimescale: 600),
+                        toleranceBefore: .zero, toleranceAfter: .zero)
+        }
+        updatePlayIcons()
+    }
+
+    // MARK: - 缩放
+
+    /// ± 每次走 2 屏。1 屏一档太慢，从 6 屏拉到 20 屏要按 14 下
+    @objc private func zoomInTapped() { zoomStep(by: 2) }
+
+    @objc private func zoomOutTapped() { zoomStep(by: -2) }
+
+    private func zoomStep(by delta: CGFloat) {
+        trackView.setZoomScreens(trackView.zoomScreens + delta)
+        overviewBar.setViewport(trackView.viewport)
+    }
+
+    // MARK: - 导出 / 返回
 
     @objc private func exportTapped() {
         guard let asset = asset, total > 0 else {
             statusLabel.text = "素材未就绪，无法导出"
             return
         }
+        stopPlayback()
         let title = (BKVideoLibrary.assetName(localID: localID) as NSString)
             .deletingPathExtension
         let panel = BKExportPanelViewController(asset: asset, duration: total,
@@ -490,11 +910,43 @@ final class BKEditorViewController: UIViewController {
         present(nav, animated: true)
     }
 
+    @objc private func closeTapped() {
+        stopPlayback()
+        navigationController?.popViewController(animated: true)
+    }
+
     /// 拖动/点选时把原片 player seek 到该源时间（暂停态下只更新画面）
     private func seekOriginal(to t: Double) {
-        guard !playingCut, player.currentItem != nil else { return }
+        guard player.currentItem != nil else { return }
         player.seek(to: CMTime(seconds: t, preferredTimescale: 600),
                     toleranceBefore: .zero, toleranceAfter: .zero)
+    }
+
+    /// 状态机统一入口：提波形期间把整个工具栏灰掉，
+    /// 免得在半成品状态上再叠一层编辑
+    private func setControlsEnabled(_ enabled: Bool) {
+        let buttons = [undoButton, redoButton, jointButton, playButton, deleteRedButton,
+                       cutButton, detectButton, zoomOutButton, zoomInButton]
+        for b in buttons {
+            b.isEnabled = enabled
+            b.alpha = enabled ? 1.0 : 0.4
+        }
+        thresholdSlider.isEnabled = enabled
+        // 撤销 / 重做 / 恢复自动 三个按钮的可用性各有各的判据，不能一刀切全亮
+        if enabled {
+            updateUndoButtons()
+            updateThresholdAutoButton()
+        }
+    }
+
+    // MARK: - 工具
+
+    /// mm:ss。时间码用这个：小数点后一位在剪辑场景里是噪音
+    private func formatClock(_ t: Double) -> String {
+        let s = max(0, t)
+        let m = Int(s) / 60
+        let sec = Int(s) % 60
+        return String(format: "%02d:%02d", m, sec)
     }
 }
 
@@ -503,33 +955,26 @@ final class BKEditorViewController: UIViewController {
 extension BKEditorViewController: BKTrackViewDelegate {
 
     func track(_ view: BKTrackView, didScrollTo time: Double) {
+        let t = min(max(time, 0), total)
+        // 手动找位置一律静音：播放中先停，再 seek（rate==0 的 seek 天然不出声）
+        if playMode != .idle { stopPlayback() }
+        seekOriginal(to: t)
+        lastTime = t
+        timeLabel.text = "\(formatClock(t)) / \(formatClock(total))"
         overviewBar.setViewport(view.viewport)
-        // 暂停态下拖动 = 预览画面跟着走（不出声）
-        if !isPlaying { seekOriginal(to: time) }
     }
 
     func track(_ view: BKTrackView, didTogglePieceAt time: Double) {
-        // 找到包含 time 的那一段
-        guard let idx = marks.firstIndex(where: { time >= $0.start - 1e-9 && time <= $0.end + 1e-9 })
-        else { return }
-        pushUndo()
-        let next = BKTimeline.toggle(marks: marks, at: idx)
-        cuts = cutsFromMarks(next)
-        marks = BKTimeline.build(duration: total, cuts: cuts)
-        refreshTrack()
+        togglePiece(at: time)
     }
 
     func track(_ view: BKTrackView, didChangeZoomTo screens: CGFloat) {
         overviewBar.setViewport(view.viewport)
     }
 
+    /// 手指一碰轨道就停。播放中一拖就暂停，不存在松手续播
     func trackDidTouchDown(_ view: BKTrackView) {
-        // 手指一碰轨道立刻停声，避免拖动第一帧漏音
-        if isPlaying {
-            player.pause()
-            isPlaying = false
-            playButton.isHidden = false
-        }
+        if playMode != .idle { stopPlayback() }
     }
 
     func trackDidPullBeyondHead(_ view: BKTrackView) {
@@ -540,6 +985,10 @@ extension BKEditorViewController: BKTrackViewDelegate {
         // 单素材：无下一条，忽略
     }
 
+    // MARK: 拖红区边缘调气口大小
+
+    /// 按下红区边缘开始拖。VC 收到就压一次撤销 —— 拖动过程每帧都回调，
+    /// 不合并的话撤销栈会被一帧一帧塞满，撤一次只退一帧
     func track(_ view: BKTrackView, didBeginRedEdgeDragNear time: Double) {
         pushUndo()
     }
@@ -550,6 +999,7 @@ extension BKEditorViewController: BKTrackViewDelegate {
         cuts = next
         marks = BKTimeline.build(duration: total, cuts: cuts)
         refreshTrack()
+        updateInfo()
     }
 
     func trackDidEndRedEdgeDrag(_ view: BKTrackView) {
@@ -567,7 +1017,12 @@ extension BKEditorViewController: BKTrackViewDelegate {
 
 extension BKEditorViewController: BKOverviewBarDelegate {
     func overview(_ bar: BKOverviewBar, didSeekTo time: Double) {
-        trackView.setPointerTime(time)
-        seekOriginal(to: time)
+        let t = min(max(time, 0), total)
+        if playMode != .idle { stopPlayback() }
+        trackView.setPointerTime(t)
+        overviewBar.setViewport(trackView.viewport)
+        seekOriginal(to: t)
+        lastTime = t
+        timeLabel.text = "\(formatClock(t)) / \(formatClock(total))"
     }
 }
