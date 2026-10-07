@@ -6,3 +6,7 @@ bkWave.xcodeproj/
 
 # 本地导出产物（导出走相册，文件不进 git）
 Exports/
+
+# 本地 CI 产物 / 未签名 ipa（下载来用爱思重签，不进 git）
+build/
+*.ipa
