@@ -8,6 +8,15 @@
 //  · 多选态：格子右上换成勾选圈，底部工具条「删除 / 全选」
 //  · 右下角蓝色 FAB ⊕（导入）；底部版本行「bk波剪 … · 已导出 N 条」，连点 7 次进日志面板
 //
+//  【★ 为什么不是 UICollectionViewController】（2026-10-08 踩坑）
+//  原来把网格当 self.view、FAB 和版本行塞进 collectionView.backgroundView ——
+//  **backgroundView 在 cell 下面**，格子一多就把蓝色加号盖住、点击也吃不到。
+//  改成 UIViewController + 自带 grid 子视图（和 bk剪辑一样）：
+//  悬浮件直接 addSubview 到 view，永远在网格之上、不随内容滚动。
+//
+//  【★ 安全区】FAB 与版本行一律约束到 safeAreaLayoutGuide ——
+//  早先贴 view.bottom 排版，正好压在 iPhone 底部横线（home indicator）上。
+//
 //  【一格 = 一批】一批 = 一次导入的多条视频，各自编辑态存在 BKClipItem 里。
 //  删除走**回收站**（deletedAt 打标记，30 天内可恢复），不是真删。
 //
@@ -15,12 +24,13 @@
 import UIKit
 import Photos
 
-final class BKRootViewController: UICollectionViewController {
+final class BKRootViewController: UIViewController {
 
     private var batches: [BKBatch] = []
     private var picking = false
     private var selected = Set<Int>()
 
+    private let grid: UICollectionView
     private let emptyLabel = UILabel()
     private let versionLabel = UILabel()
     private let fab = UIButton(type: .system)
@@ -29,8 +39,9 @@ final class BKRootViewController: UICollectionViewController {
         let layout = UICollectionViewFlowLayout()
         layout.minimumInteritemSpacing = 6
         layout.minimumLineSpacing = 6
-        layout.sectionInset = UIEdgeInsets(top: 10, left: 10, bottom: 90, right: 10)
-        super.init(collectionViewLayout: layout)
+        layout.sectionInset = UIEdgeInsets(top: 10, left: 10, bottom: 110, right: 10)
+        grid = UICollectionView(frame: .zero, collectionViewLayout: layout)
+        super.init(nibName: nil, bundle: nil)
     }
 
     required init?(coder: NSCoder) { fatalError("bk波剪不走 storyboard") }
@@ -40,9 +51,13 @@ final class BKRootViewController: UICollectionViewController {
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = BKTheme.Color.page
-        collectionView.backgroundColor = BKTheme.Color.page
-        collectionView.register(BKBatchCell.self, forCellWithReuseIdentifier: BKBatchCell.reuseID)
-        collectionView.alwaysBounceVertical = true
+
+        grid.backgroundColor = BKTheme.Color.page
+        grid.dataSource = self
+        grid.delegate = self
+        grid.alwaysBounceVertical = true
+        grid.register(BKBatchCell.self, forCellWithReuseIdentifier: BKBatchCell.reuseID)
+        view.addSubview(grid)
 
         navigationItem.leftBarButtonItem = UIBarButtonItem(
             image: UIImage(systemName: "trash"), style: .plain,
@@ -58,25 +73,9 @@ final class BKRootViewController: UICollectionViewController {
         emptyLabel.textColor = BKTheme.Color.text2
         emptyLabel.textAlignment = .center
         emptyLabel.numberOfLines = 0
-        emptyLabel.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(emptyLabel)
-        NSLayoutConstraint.activate([
-            emptyLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            emptyLabel.centerYAnchor.constraint(equalTo: view.centerYAnchor),
-            emptyLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 32),
-            emptyLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -32)
-        ])
 
-        // ---- 版本行 + FAB：挂 backgroundView（不随内容滚动，永远贴底可点）----
-        versionLabel.font = BKTheme.Font.small
-        versionLabel.textColor = BKTheme.Color.text3
-        versionLabel.textAlignment = .center
-        versionLabel.isUserInteractionEnabled = true
-        // 调试入口藏在版本号后面，连点 7 次
-        versionLabel.addGestureRecognizer(
-            UITapGestureRecognizer(target: self, action: #selector(versionTapped))
-        )
-
+        // ---- 右下角 FAB ⊕ ----（在网格之上，避开底部安全区）
         fab.setImage(UIImage(systemName: "plus"), for: .normal)
         fab.tintColor = .white
         fab.backgroundColor = BKTheme.Color.accent
@@ -85,30 +84,61 @@ final class BKRootViewController: UICollectionViewController {
         fab.layer.shadowOpacity = 0.25
         fab.layer.shadowOffset = CGSize(width: 0, height: 3)
         fab.layer.shadowRadius = 6
+        fab.accessibilityLabel = "导入视频"
         fab.addTarget(self, action: #selector(fabTapped), for: .touchUpInside)
+        view.addSubview(fab)
 
-        let bg = UIView()
-        bg.backgroundColor = BKTheme.Color.page
-        versionLabel.translatesAutoresizingMaskIntoConstraints = false
-        fab.translatesAutoresizingMaskIntoConstraints = false
-        bg.addSubview(versionLabel)
-        bg.addSubview(fab)
+        // ---- 底部版本行 ----（连点 7 次进运行日志面板）
+        versionLabel.font = BKTheme.Font.small
+        versionLabel.textColor = BKTheme.Color.text3
+        versionLabel.textAlignment = .center
+        versionLabel.isUserInteractionEnabled = true
+        versionLabel.addGestureRecognizer(
+            UITapGestureRecognizer(target: self, action: #selector(versionTapped))
+        )
+        view.addSubview(versionLabel)
+
+        for v in [grid, emptyLabel, fab, versionLabel] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+        }
         NSLayoutConstraint.activate([
-            versionLabel.bottomAnchor.constraint(equalTo: bg.bottomAnchor, constant: -6),
-            versionLabel.centerXAnchor.constraint(equalTo: bg.centerXAnchor),
+            grid.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            grid.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            grid.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            grid.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+
+            emptyLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            emptyLabel.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+            emptyLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 32),
+            emptyLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -32),
 
             fab.widthAnchor.constraint(equalToConstant: 56),
             fab.heightAnchor.constraint(equalToConstant: 56),
-            fab.trailingAnchor.constraint(equalTo: bg.trailingAnchor, constant: -20),
-            fab.bottomAnchor.constraint(equalTo: bg.safeAreaLayoutGuide.bottomAnchor, constant: -26)
+            fab.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
+            fab.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -18),
+
+            versionLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            versionLabel.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor,
+                                                constant: -4)
         ])
-        collectionView.backgroundView = bg
     }
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         navigationController?.setToolbarHidden(!picking, animated: false)
         reload()
+    }
+
+    override func viewWillLayoutSubviews() {
+        super.viewWillLayoutSubviews()
+        if let layout = grid.collectionViewLayout as? UICollectionViewFlowLayout {
+            let inset = layout.sectionInset
+            let gap = layout.minimumInteritemSpacing
+            let cols: CGFloat = 3
+            let w = (grid.bounds.width - inset.left - inset.right - gap * (cols - 1)) / cols
+            // 竖版封面（≈9:16 略收），照 bk剪辑草稿格的比例
+            layout.itemSize = CGSize(width: max(0, w), height: max(0, w * 1.45))
+        }
     }
 
     // MARK: - 刷新
@@ -121,7 +151,7 @@ final class BKRootViewController: UICollectionViewController {
         versionLabel.text = String(format: "bk波剪 专剪口播 v%@ · 已导出 %d 条",
                                    BKConfig.appVersion, BKConfig.exportCount)
         navigationItem.rightBarButtonItem?.isEnabled = !batches.isEmpty
-        collectionView.reloadData()
+        grid.reloadData()
     }
 
     // MARK: - 导入
@@ -193,9 +223,9 @@ final class BKRootViewController: UICollectionViewController {
 
     @objc private func pickTapped() {
         picking.toggle()
-        collectionView.allowsMultipleSelection = picking
+        grid.allowsMultipleSelection = picking
         if !picking { selected.removeAll() }
-        collectionView.reloadData()
+        grid.reloadData()
         navigationController?.setToolbarHidden(!picking, animated: false)
         navigationItem.rightBarButtonItem?.image =
             UIImage(systemName: picking ? "xmark.circle" : "checkmark.circle")
@@ -232,7 +262,7 @@ final class BKRootViewController: UICollectionViewController {
         } else {
             selected = Set(0 ..< batches.count)
         }
-        collectionView.reloadData()
+        grid.reloadData()
         updateTrashBar()
     }
 
@@ -283,27 +313,18 @@ final class BKRootViewController: UICollectionViewController {
         alert.addAction(UIAlertAction(title: "取消", style: .cancel))
         present(alert, animated: true)
     }
+}
 
-    // MARK: - 集合视图
+// MARK: - 网格
 
-    override func viewWillLayoutSubviews() {
-        super.viewWillLayoutSubviews()
-        if let layout = collectionView.collectionViewLayout as? UICollectionViewFlowLayout {
-            let inset = layout.sectionInset
-            let gap = layout.minimumInteritemSpacing
-            let cols: CGFloat = 3
-            let w = (collectionView.bounds.width - inset.left - inset.right - gap * (cols - 1)) / cols
-            // 竖版封面（≈9:16 略收），照 bk剪辑草稿格的比例
-            layout.itemSize = CGSize(width: max(0, w), height: max(0, w * 1.45))
-        }
-    }
+extension BKRootViewController: UICollectionViewDataSource, UICollectionViewDelegateFlowLayout {
 
-    override func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int {
+    func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int {
         batches.count
     }
 
-    override func collectionView(_ collectionView: UICollectionView,
-                                 cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
+    func collectionView(_ collectionView: UICollectionView,
+                        cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
         let cell = collectionView.dequeueReusableCell(withReuseIdentifier: BKBatchCell.reuseID,
                                                       for: indexPath) as! BKBatchCell
         let batch = batches[indexPath.item]
@@ -312,7 +333,7 @@ final class BKRootViewController: UICollectionViewController {
         return cell
     }
 
-    override func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
+    func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
         let batch = batches[indexPath.item]
         if picking {
             // 多选态：点格 = 勾选/取消
