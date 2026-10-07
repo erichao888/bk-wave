@@ -26,7 +26,8 @@
 //
 //  ✗✗ 键在单素材版里的语义 = 「清空全部红区」（ck 里它是「删红折叠进第二阶段」，
 //  bk波剪没有第二阶段，cuts 就是最终删除区间，所以等价动作是全部恢复）。
-//  ✕ 键 = 放弃这条视频返回选择页（ck 里它是「从批次移除」，单素材版等价于退出）。
+//  ✕ 键 = 把这条从本批素材列表清除，并**自动跳到下一条继续剪**（ck 里它就是「从批次移除」）。
+//  废片（整条口播都不对）没必要剪也没必要导，清掉后接着剪下一条，流程不中断。
 //
 //  【指针居中带来的一个连锁变化】
 //  指针不动、内容滚，所以「预览画面跟指针跳帧」变成了：
@@ -125,7 +126,7 @@ final class BKEditorViewController: UIViewController {
     private let cutButton = UIButton(type: .system)
     private let detectButton = UIButton(type: .system)
 
-    // 工具栏第二排：✕（放弃本条，红色圆）在 − + 左边
+    // 工具栏第二排：✕（清除本条，红色圆）在 − + 左边
     private let removeButton = UIButton(type: .system)
     private let zoomOutButton = UIButton(type: .system)
     private let zoomInButton = UIButton(type: .system)
@@ -507,7 +508,8 @@ final class BKEditorViewController: UIViewController {
         ])
     }
 
-    /// ✕ 按钮：红色实心圆 + 白叉，一眼认出是「危险操作」。点下去**先弹确认框**，不直接退
+    /// ✕ 按钮：红色实心圆 + 白叉，一眼认出是「危险操作」。
+    /// 点下去**先弹确认框**，确认后从本批清除这条并自动跳下一条 —— 不直接动手
     private func styleRemoveStep(_ button: UIButton, action: Selector) {
         let cfg = UIImage.SymbolConfiguration(pointSize: 14, weight: .bold)
         button.setImage(UIImage(systemName: "xmark", withConfiguration: cfg), for: .normal)
@@ -875,18 +877,49 @@ final class BKEditorViewController: UIViewController {
         return out
     }
 
-    // MARK: - ✕ 放弃本条返回选择页
+    // MARK: - ✕ 从视频列表清除本条（清完自动接下一条）
 
+    /// ✕ = 把当前这条从**本批素材列表**里清掉（不动相册原片），然后自动跳到下一条继续剪。
+    ///
+    /// 场景（皓哥 2026-10-08）：挑进来一条发现整条都是废口播 —— 没必要剪、也没必要导，
+    /// 就别让它占着列表。清掉之后直接接着剪下一条，流程不中断。
     @objc private func removeTapped() {
         let name = BKVideoLibrary.assetName(localID: localID)
-        let alert = UIAlertController(title: "放弃这条视频？",
-                                      message: "「\(name)」的剪辑不会保留，返回后重新选。",
-                                      preferredStyle: .alert)
+        let alert = UIAlertController(
+            title: "将当前视频从视频列表清除吗？",
+            message: "「\(name)」会从本批素材里移除（相册里的原片不受影响），并自动接着剪下一条。",
+            preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "取消", style: .cancel, handler: nil))
-        alert.addAction(UIAlertAction(title: "放弃", style: .destructive) { [weak self] _ in
-            self?.navigationController?.popViewController(animated: true)
+        alert.addAction(UIAlertAction(title: "确定", style: .destructive) { [weak self] _ in
+            self?.removeCurrentItem()
         })
         present(alert, animated: true)
+    }
+
+    /// 移除当前条 → 整批落盘 → 跳到下一条的波剪页继续剪
+    private func removeCurrentItem() {
+        guard let bid = batchID else { return }
+        stopPlayback()
+        guard var batch = BKDraftStore.shared.batch(id: bid),
+              batch.items.indices.contains(itemIndex) else { return }
+
+        let removed = batch.items.remove(at: itemIndex)
+        BKLog.shared.i("从本批移除素材 \(removed.assetName)")
+
+        // 批里一条都不剩 → 整批也删掉，别在首页留个 0 条的空批
+        if batch.items.isEmpty {
+            BKDraftStore.shared.delete(batch)
+            navigationController?.popToRootViewController(animated: true)
+            return
+        }
+        BKDraftStore.shared.save(batch)
+
+        // 跳到下一条：删掉之后原本的下一条会落到同一个 index；删的是最后一条就退到前一条。
+        // 重排 nav 栈为 [首页, 新编辑器]，避免 首页→编辑器→编辑器 无限堆叠
+        guard let nav = navigationController, let root = nav.viewControllers.first else { return }
+        let nextIndex = min(itemIndex, batch.items.count - 1)
+        let editor = BKEditorViewController(batchID: bid, index: nextIndex)
+        nav.setViewControllers([root, editor], animated: true)
     }
 
     // MARK: - 阈值
