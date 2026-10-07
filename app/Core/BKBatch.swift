@@ -41,6 +41,10 @@ struct BKClipItem: Codable, Identifiable {
     var localID: String
     /// 素材名（去扩展名），列表展示用，落盘免得每次查相册
     var assetName: String
+    /// 原片时长（秒）。★ **必须可选**：v1.1.2 之前存的草稿 JSON 里没有这个键，
+    /// 写成非可选会让 synthesized Codable 直接解码失败、老草稿全丢（2B-2 踩过的同款坑）。
+    /// 缺失时列表现场用 BKVideoLibrary.duration(localID:) 补
+    var duration: Double?
     /// 源时间删除区间（与 BKEditorViewController.cuts 同一口径）
     var cuts: [BKRange]
     /// 折叠后的保留段；nil = 未折叠（红区还在，cuts 是删除区间）
@@ -52,6 +56,16 @@ struct BKClipItem: Codable, Identifiable {
 
     /// 「删过红区」：用户动过刀，或已经折叠红区
     var hasDeletedRed: Bool { everEdited || keepBase != nil }
+
+    /// 删红后时长（秒）。**没删过红返回 nil** —— 调用方据此显示「无删红」
+    var trimmedDuration: Double? {
+        guard hasDeletedRed else { return nil }
+        if let kb = keepBase {
+            return kb.reduce(0.0) { $0 + max(0, $1.end - $1.start) }
+        }
+        let cut = cuts.reduce(0.0) { $0 + max(0, $1.end - $1.start) }
+        return max(0, (duration ?? 0) - cut)
+    }
 }
 
 /// 一次导入的多条视频 = 一批。

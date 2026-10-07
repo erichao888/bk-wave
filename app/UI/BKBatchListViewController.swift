@@ -149,6 +149,15 @@ final class BKBatchListViewController: UIViewController {
         var ok = 0
         var failed: [String] = []
 
+        // 进度文案：第几条 + 总进度% + 本条%。
+        // 只报「第 i/N」用户根本不知道要等多久（BKExporter 注释里那条铁律），百分比才是人能感知的
+        func message(_ i: Int, _ name: String, _ frac: Double) -> String {
+            let f = min(max(frac, 0), 1)
+            let overall = (Double(i) + f) / Double(items.count)
+            let line1 = "正在导出 \(i + 1)/\(items.count) · 总 \(Int(overall * 100))%"
+            return line1 + "\n" + name + "\n本条 \(Int(f * 100))%"
+        }
+
         func step(_ i: Int) {
             if i >= items.count {
                 hud.dismiss(animated: true) {
@@ -163,7 +172,7 @@ final class BKBatchListViewController: UIViewController {
                 return
             }
             let item = items[i]
-            hud.message = "正在导出 \(i + 1)/\(items.count)\n\(item.assetName)"
+            hud.message = message(i, item.assetName, 0)
             BKVideoLibrary.loadAVAsset(localID: item.localID) { asset in
                 guard let asset = asset else {
                     failed.append(item.assetName + "（读取失败）")
@@ -181,7 +190,10 @@ final class BKBatchListViewController: UIViewController {
                 let part = BKCompositionBuilder.Part(asset: asset, name: item.assetName,
                                                      keeps: keeps, speed: 1.0)
                 BKExporter.export(title: item.assetName, sources: [part], spec: spec,
-                                 progress: { _, _, _ in },
+                                 progress: { _, _, frac in
+                                     // BKExporter 的 progress 已切回主线程，直接刷文案
+                                     hud.message = message(i, item.assetName, frac)
+                                 },
                                  completion: { result in
                     switch result {
                     case .success(let url):
@@ -208,15 +220,19 @@ extension BKBatchListViewController: UITableViewDataSource, UITableViewDelegate 
         batch?.items.count ?? 0
     }
 
-    func tableView(_ tableView: UITableView, heightForRowAt indexPath: IndexPath) -> CGFloat { 56 }
+    func tableView(_ tableView: UITableView, heightForRowAt indexPath: IndexPath) -> CGFloat { 60 }
 
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
         let cell = tableView.dequeueReusableCell(withIdentifier: BatchRowCell.reuseID,
                                                  for: indexPath) as! BatchRowCell
         if let item = batch?.items[indexPath.item] {
+            // 老草稿（v1.1.2 之前存的）没有 duration 字段，现场向相册补一次
+            let raw = item.duration ?? BKVideoLibrary.duration(localID: item.localID)
             cell.configure(name: item.assetName,
                            edited: item.hasDeletedRed,
-                           selected: selected.contains(indexPath.item))
+                           selected: selected.contains(indexPath.item),
+                           rawDuration: raw,
+                           trimmed: item.trimmedDuration)
             cell.onToggle = { [weak self] in self?.toggle(indexPath.item) }
         }
         return cell
@@ -235,6 +251,7 @@ final class BatchRowCell: UITableViewCell {
     static let reuseID = "BatchRowCell"
 
     private let nameLabel = UILabel()
+    private let subLabel = UILabel()
     private let checkButton = UIButton(type: .system)
 
     var onToggle: (() -> Void)?
@@ -249,12 +266,17 @@ final class BatchRowCell: UITableViewCell {
         nameLabel.textColor = BKTheme.Color.text
         contentView.addSubview(nameLabel)
 
+        // 第二行：原时长 → 删红后时长；没删过红就标「无删红」
+        subLabel.font = BKTheme.Font.monoSmall
+        subLabel.textColor = BKTheme.Color.text3
+        contentView.addSubview(subLabel)
+
         checkButton.setImage(UIImage(systemName: "circle"), for: .normal)
         checkButton.tintColor = BKTheme.Color.text2
         checkButton.addTarget(self, action: #selector(checkTapped), for: .touchUpInside)
         contentView.addSubview(checkButton)
 
-        for v in [nameLabel, checkButton] {
+        for v in [nameLabel, subLabel, checkButton] {
             v.translatesAutoresizingMaskIntoConstraints = false
         }
         NSLayoutConstraint.activate([
@@ -265,19 +287,38 @@ final class BatchRowCell: UITableViewCell {
 
             nameLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
             nameLabel.trailingAnchor.constraint(lessThanOrEqualTo: checkButton.leadingAnchor, constant: -12),
-            nameLabel.centerYAnchor.constraint(equalTo: contentView.centerYAnchor)
+            nameLabel.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 9),
+
+            subLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
+            subLabel.trailingAnchor.constraint(lessThanOrEqualTo: checkButton.leadingAnchor, constant: -12),
+            subLabel.topAnchor.constraint(equalTo: nameLabel.bottomAnchor, constant: 3)
         ])
     }
 
     required init?(coder: NSCoder) { fatalError("bk波剪不走 storyboard") }
 
-    func configure(name: String, edited: Bool, selected: Bool) {
+    func configure(name: String, edited: Bool, selected: Bool,
+                   rawDuration: Double, trimmed: Double?) {
         nameLabel.text = name
         // 删过红区标红，没动过的默认色
         nameLabel.textColor = edited ? BKTheme.Color.danger : BKTheme.Color.text
+        if let t = trimmed {
+            subLabel.text = "原 \(Self.clock(rawDuration)) → 剪后 \(Self.clock(t))"
+            subLabel.textColor = BKTheme.Color.success
+        } else {
+            // 没进行过删红操作：只显示原时长，标注「无删红」
+            subLabel.text = "原 \(Self.clock(rawDuration)) · 无删红"
+            subLabel.textColor = BKTheme.Color.text3
+        }
         let img = selected ? "checkmark.circle.fill" : "circle"
         checkButton.setImage(UIImage(systemName: img), for: .normal)
         checkButton.tintColor = selected ? BKTheme.Color.accent : BKTheme.Color.text2
+    }
+
+    /// mm:ss。列表里一律用这个口径，别出现「1:23」和「01:23」两种写法
+    private static func clock(_ t: Double) -> String {
+        let s = max(0, t)
+        return String(format: "%02d:%02d", Int(s) / 60, Int(s) % 60)
     }
 
     @objc private func checkTapped() {

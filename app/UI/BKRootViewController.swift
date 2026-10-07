@@ -16,6 +16,7 @@ final class BKRootViewController: UICollectionViewController {
 
     private var batches: [BKBatch] = []
     private let emptyLabel = UILabel()
+    private let versionLabel = UILabel()
     private let addButton = UIBarButtonItem()
 
     init() {
@@ -55,6 +56,32 @@ final class BKRootViewController: UICollectionViewController {
             emptyLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 32),
             emptyLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -32)
         ])
+
+        // ---- 版本号（连点 7 次进运行日志面板）----
+        // ⚠️ UICollectionViewController 的 view 就是 collectionView，直接加子视图会跟着
+        //    内容一起滚走。挂在 backgroundView 上：它不随内容滚动，永远贴在底部可点
+        versionLabel.font = BKTheme.Font.small
+        versionLabel.textColor = BKTheme.Color.text3
+        versionLabel.textAlignment = .center
+        versionLabel.text = "bk波剪 v\(BKConfig.appVersion)"
+        versionLabel.isUserInteractionEnabled = true
+        versionLabel.addGestureRecognizer(
+            UITapGestureRecognizer(target: self, action: #selector(versionTapped))
+        )
+        let bg = UIView()
+        bg.backgroundColor = BKTheme.Color.bg
+        versionLabel.translatesAutoresizingMaskIntoConstraints = false
+        bg.addSubview(versionLabel)
+        NSLayoutConstraint.activate([
+            versionLabel.bottomAnchor.constraint(equalTo: bg.bottomAnchor, constant: -6),
+            versionLabel.centerXAnchor.constraint(equalTo: bg.centerXAnchor)
+        ])
+        collectionView.backgroundView = bg
+    }
+
+    /// 连点版本号 7 次 → 运行日志面板（排查时从这里把 bk.log 分享出来）
+    @objc private func versionTapped() {
+        BKDebug.tapVersionTag(self)
     }
 
     override func viewWillAppear(_ animated: Bool) {

@@ -75,6 +75,7 @@ final class BKDraftStore {
             BKClipItem(id: UUID(),
                        localID: id,
                        assetName: (BKVideoLibrary.assetName(localID: id) as NSString).deletingPathExtension,
+                       duration: BKVideoLibrary.duration(localID: id),
                        cuts: [],
                        keepBase: nil,
                        thresholdDb: -35,
