@@ -3,9 +3,11 @@
 //  bk波剪 — 导入时多选相册视频
 //
 //  【为什么自建勾选页，不走系统 PHPicker】
-//  系统选择器没有「点格即选、再点取消」这套手势，挑素材时看不到片段对不对。
-//  这里复用首页的 BKVideoPickCell 做格子，开启 allowsMultipleSelection，
-//  选中格描蓝边，右上「导入(N)」回传选中的 localID 列表。
+//  系统选择器没有「点格当场播 / 点圆圈勾选」这套手势，挑素材时看不到片段对不对。
+//  这里复用首页的 BKVideoPickCell 做格子：
+//    · 点格子   → 选中（描蓝边）+ 立刻进 BKVideoPreviewViewController 全屏播放
+//    · 预览页右上角的圆圈 → 当场勾选 / 取消，不用退回网格再找
+//    · 右上「导入(N)」回传选中的 localID 列表（按相册顺序）
 //
 
 import UIKit
@@ -37,7 +39,10 @@ final class BKImportPickerViewController: UICollectionViewController {
         title = "选择视频"
         collectionView.backgroundColor = BKTheme.Color.bg
         collectionView.register(BKVideoPickCell.self, forCellWithReuseIdentifier: BKVideoPickCell.reuseID)
-        collectionView.allowsMultipleSelection = true
+        // 选中态自己维护：点格子 = 选中 + 当场进全屏预览播放。
+        // 交给系统多选的话，再点一次已选的格子会触发 didDeselect（把选中取消掉），
+        // 而皓哥要的是「点了就播」，取消勾选统一放到预览页右上角的圆圈里
+        collectionView.allowsMultipleSelection = false
         collectionView.alwaysBounceVertical = true
 
         cancelButton.title = "取消"
@@ -54,6 +59,13 @@ final class BKImportPickerViewController: UICollectionViewController {
         navigationItem.rightBarButtonItem = doneButton
 
         reloadVideos()
+    }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        // 从预览页回来（可能在那里取消了勾选），重画蓝框与计数
+        refreshBorders()
+        updateDone()
     }
 
     override func viewWillLayoutSubviews() {
@@ -108,22 +120,40 @@ final class BKImportPickerViewController: UICollectionViewController {
         return cell
     }
 
+    /// 点格子 = 选中（蓝框）+ **当场进全屏预览播放**。
+    /// 取消选中的入口放在预览页右上角的圆圈里（与 ck v1.2.7 勾选页同一套手势）：
+    /// 挑素材时先听一耳朵看一眼，不对就在预览页里直接取消，不用退回网格再找
     override func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
+        guard indexPath.item < localIDs.count else { return }
         let id = localIDs[indexPath.item]
         selected.insert(id)
-        if let cell = collectionView.cellForItem(at: indexPath) {
-            cell.contentView.layer.borderWidth = 3
-            cell.contentView.layer.borderColor = BKTheme.Color.accent.cgColor
-        }
+        refreshBorders()
         updateDone()
+        openPreview(localID: id)
     }
 
-    override func collectionView(_ collectionView: UICollectionView, didDeselectItemAt indexPath: IndexPath) {
-        let id = localIDs[indexPath.item]
-        selected.remove(id)
-        if let cell = collectionView.cellForItem(at: indexPath) {
-            cell.contentView.layer.borderWidth = 0
+    /// 全屏预览：进来直接播，右上角圆圈可当场勾选 / 取消
+    private func openPreview(localID: String) {
+        let preview = BKVideoPreviewViewController(localID: localID,
+                                                   isPicked: selected.contains(localID))
+        preview.modalPresentationStyle = .fullScreen
+        preview.onTogglePick = { [weak self, weak preview] id in
+            guard let self = self else { return }
+            let on = preview?.isPicked ?? false
+            if on { self.selected.insert(id) } else { self.selected.remove(id) }
+            self.updateDone()
+            self.refreshBorders()
         }
-        updateDone()
+        present(preview, animated: true)
+    }
+
+    /// 按当前选中集合重画所有可见格的蓝框
+    private func refreshBorders() {
+        for ip in collectionView.indexPathsForVisibleItems where ip.item < localIDs.count {
+            guard let cell = collectionView.cellForItem(at: ip) else { continue }
+            let on = selected.contains(localIDs[ip.item])
+            cell.contentView.layer.borderWidth = on ? 3 : 0
+            cell.contentView.layer.borderColor = BKTheme.Color.accent.cgColor
+        }
     }
 }

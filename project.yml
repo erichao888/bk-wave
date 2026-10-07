@@ -57,7 +57,7 @@ targets:
         # 必须是纯英文！爱思用个人 Apple ID 重签名时，包内路径出现中文会报「签名失败，错误码 45」
         PRODUCT_NAME: bkWave
         CFBundleName: bkWave
-        MARKETING_VERSION: "1.1.1"
+        MARKETING_VERSION: "1.1.2"
         CURRENT_PROJECT_VERSION: "1"
         CODE_SIGN_STYLE: Automatic
 
