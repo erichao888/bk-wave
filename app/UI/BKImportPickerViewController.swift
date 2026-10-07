@@ -233,7 +233,13 @@ final class BKImportPickerViewController: UIViewController {
 
     @objc private func doneTapped() {
         guard !picked.isEmpty else { return }
-        onDone?(picked)
+        // ★ 必须先 dismiss 整个勾选页、再回调 —— 否则 modal 一直盖在首页上，
+        //   Root 往被遮住的那个导航栈 push 波剪页，用户看着就是「点了添加没反应」。
+        //   （v1.1.1 漏了这步：onDone 里既没 dismiss 也没等动画结束）
+        let ids = picked
+        dismiss(animated: true) { [weak self] in
+            self?.onDone?(ids)
+        }
     }
 
     @objc private func closeTapped() {

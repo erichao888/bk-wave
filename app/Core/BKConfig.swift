@@ -32,6 +32,21 @@ enum BKConfig {
     static let buildNumber =
         Int(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "") ?? 1
 
+    // MARK: - 累计导出条数（首页版本行「已导出 N 条」用）
+    //
+    // 存 UserDefaults：跨批次、跨启动累加，不跟着某个草稿走。
+    // 只增不减——删除草稿不清这个数（它记录的是「这台手机导出过多少条成品」）
+
+    private static let exportCountKey = "bk_export_count"
+
+    static var exportCount: Int {
+        UserDefaults.standard.integer(forKey: exportCountKey)
+    }
+
+    static func incrementExportCount() {
+        UserDefaults.standard.set(exportCount + 1, forKey: exportCountKey)
+    }
+
     // MARK: - 气口检测参数
     //
     // 这四个数是「防碎」四重保险，缺一不可。它们的来历和边界都在

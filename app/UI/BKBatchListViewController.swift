@@ -36,11 +36,14 @@ final class BKBatchListViewController: UIViewController {
     private let exportButton = UIButton(type: .system)
     private let selectAllButton = UIBarButtonItem(title: "全选", style: .plain, target: nil, action: nil)
 
-    /// - Parameter preselect: 进来就勾上的序号（波剪页「导出」传当前条）
-    init(batchID: UUID, preselect: Int? = nil) {
+    /// - Parameters:
+    ///   - preselect: 进来就勾上的序号（波剪页「导出」传当前条）
+    ///   - selectAll: 进来就全勾（首页草稿格「···」→ 导出 用）
+    init(batchID: UUID, preselect: Int? = nil, selectAll: Bool = false) {
         self.batchID = batchID
         super.init(nibName: nil, bundle: nil)
         if let p = preselect { selected.insert(p) }
+        if selectAll { selected = Set(0 ..< 64) }   // 上限放宽，reload 时会按实际条数裁掉
     }
 
     required init?(coder: NSCoder) { fatalError("bk波剪不走 storyboard") }
@@ -301,7 +304,12 @@ final class BKBatchListViewController: UIViewController {
                     switch result {
                     case .success(let url):
                         BKExporter.saveToPhotos(url: url, fileName: url.lastPathComponent) { okSave in
-                            if okSave { ok += 1 } else { failed.append(item.assetName) }
+                            if okSave {
+                                ok += 1
+                                BKConfig.incrementExportCount()   // 首页版本行「已导出 N 条」
+                            } else {
+                                failed.append(item.assetName)
+                            }
                             step(i + 1)
                         }
                     case .failure:

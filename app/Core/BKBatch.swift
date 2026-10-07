@@ -53,9 +53,19 @@ struct BKClipItem: Codable, Identifiable {
     var autoThresholdDb: Double?
     /// 用户是否动过刀（决定 ☰ 列表里文件名是否标红）
     var everEdited: Bool
+    /// 折叠红区时的删除区间数（「N 刀」徽标用）。
+    /// ★ 可选：老草稿 JSON 没这键，非可选会解码失败（同 duration 的坑）。
+    /// 折叠后 cuts 被清空，刀数只能靠它记；未折叠时直接数 cuts
+    var redCount: Int?
 
     /// 「删过红区」：用户动过刀，或已经折叠红区
     var hasDeletedRed: Bool { everEdited || keepBase != nil }
+
+    /// 这条的刀数（删除区间数）：未折叠数 cuts，折叠后 cuts 已清空、靠 redCount 记
+    var cutCount: Int {
+        if keepBase != nil { return redCount ?? 0 }
+        return cuts.count
+    }
 
     /// 删红后时长（秒）。**没删过红返回 nil** —— 调用方据此显示「无删红」
     var trimmedDuration: Double? {
@@ -75,9 +85,16 @@ struct BKBatch: Codable, Identifiable {
     var items: [BKClipItem]
     var createdAt: Date
     var lastEditedAt: Date
+    /// 移入回收站的时间；nil = 正常显示。★ 可选：老草稿没这键
+    var deletedAt: Date?
 
     /// 标题缺省时按条数生成，保证列表有字
     var displayTitle: String {
         title.isEmpty ? String(format: "未命名 %d 条", items.count) : title
+    }
+
+    /// 批内总刀数（各条删除区间数之和）—— 草稿格左上角「N 刀」徽标用
+    var totalCuts: Int {
+        items.reduce(0) { $0 + $1.cutCount }
     }
 }

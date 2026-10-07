@@ -89,6 +89,8 @@ final class BKEditorViewController: UIViewController {
 
     /// 用户是否动过刀（决定 ☰ 列表里文件名是否标红）
     private var everEdited: Bool = false
+    /// 折叠红区时的删除区间数（首页「N 刀」徽标用；折叠后 cuts 清空，只能靠它记）
+    private var redCount = 0
     /// 落盘 debounce 任务
     private var persistWork: DispatchWorkItem?
 
@@ -600,6 +602,7 @@ final class BKEditorViewController: UIViewController {
         self.thresholdDb = item.thresholdDb
         self.autoThresholdDb = item.autoThresholdDb
         self.everEdited = item.everEdited
+        self.redCount = item.redCount ?? 0
         self.thresholdSlider.value = Float(self.thresholdDb)
         self.thresholdTitle.text = String(format: "阈值 %.1f dB", self.thresholdDb)
         if let base = self.keepBase {
@@ -639,6 +642,9 @@ final class BKEditorViewController: UIViewController {
                 // 重新检测 = 退折叠，回到原始时间轴
                 self.keepBase = nil
                 self.total = self.assetTotal
+                // ★ 退折叠必须清 splits：折叠态的分割线存的是**成品时间轴**坐标，
+                //   换回源轴后继续用会错位（未折叠时显示轴≡源轴）
+                self.splits = []
                 self.cuts = outcome.cuts
                 self.marks = BKTimeline.build(duration: dur, cuts: self.cuts)
                 self.thresholdDb = outcome.info.thresholdDb
@@ -685,7 +691,15 @@ final class BKEditorViewController: UIViewController {
             for (s, e) in base {
                 let len = max(0, e - s)
                 map.append((out: acc, src: s, dur: len))
-                foldedPieces.append(BKMark(start: acc, end: acc + len, kind: .keep))
+                // 段内按 ✂ 分割线（成品时间轴坐标）细分
+                var c = acc
+                let inner = splits.filter { $0 > acc + 0.05 && $0 < acc + len - 0.05 }.sorted()
+                for sp in inner {
+                    foldedPieces.append(BKMark(start: c, end: sp, kind: .keep))
+                    foldedPieces.append(BKMark(start: sp, end: sp, kind: .keep))
+                    c = sp
+                }
+                foldedPieces.append(BKMark(start: c, end: acc + len, kind: .keep))
                 // 段间插零长度标记当分割线（redFolded 时画缝，保留「可单独编辑」的视觉）
                 foldedPieces.append(BKMark(start: acc + len, end: acc + len, kind: .keep))
                 acc += len
@@ -781,11 +795,11 @@ final class BKEditorViewController: UIViewController {
 
     /// ✂ 把指针所在的地方切开。**切开 ≠ 删除**：切口不进 cuts，
     /// 导出时长纹丝不动。作用是把一段划成两段，好让你单独处理其中一半
+    ///
+    /// 【折叠态也能切】splits 一律存**显示时间轴**坐标：未折叠时显示轴≡源轴（同一套），
+    /// 折叠后显示轴是成品时间轴。★ 退折叠时必须清空 splits（见 runDetection），
+    /// 否则成品轴坐标会被当源轴用，切缝错位。
     @objc private func cutTapped() {
-        guard keepBase == nil else {
-            statusLabel.text = "已折叠，重检后可再编辑"
-            return
-        }
         let t = min(max(lastTime, 0), total)
         guard t > 0.05, t < total - 0.05 else {
             statusLabel.text = "指针太靠两头了，这里切不出东西"
@@ -825,7 +839,9 @@ final class BKEditorViewController: UIViewController {
         updateInfo()
         statusLabel.text = String(format: "已删除 %d 处红区，主轨仅剩保留段（%d 段 · 剪后 %.1fs）",
                                   cuts.count, keeps.count, folded)
-        // 折叠后红区已并入主轨之外，删除区间无需再持有
+        // 折叠后红区已并入主轨之外，删除区间无需再持有；
+        // 刀数先记下来（首页「N 刀」徽标用，cuts 一清空就数不到了）
+        redCount = cuts.count
         cuts = []
         everEdited = true
         schedulePersist()
@@ -1102,6 +1118,8 @@ final class BKEditorViewController: UIViewController {
         batch.items[itemIndex].thresholdDb = self.thresholdDb
         batch.items[itemIndex].autoThresholdDb = self.autoThresholdDb
         batch.items[itemIndex].everEdited = self.everEdited
+        // 只有折叠态才记刀数（未折叠时刀数 = cuts.count 现场可数）
+        batch.items[itemIndex].redCount = (self.keepBase != nil) ? self.redCount : nil
         BKDraftStore.shared.save(batch)
     }
 

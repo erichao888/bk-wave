@@ -37,10 +37,43 @@ final class BKDraftStore {
         try? data.write(to: fileURL, options: .atomic)
     }
 
-    /// 所有批，按最近编辑时间倒序（最新的在最前）
+    /// 所有批，按最近编辑时间倒序（最新的在最前）。**不含回收站里的**
     func allBatches() -> [BKBatch] {
         lock.lock(); defer { lock.unlock() }
-        return cache.values.sorted { $0.lastEditedAt > $1.lastEditedAt }
+        return cache.values
+            .filter { $0.deletedAt == nil }
+            .sorted { $0.lastEditedAt > $1.lastEditedAt }
+    }
+
+    /// 回收站里的批（deletedAt 非空），最近删的在前
+    func trashBatches() -> [BKBatch] {
+        lock.lock(); defer { lock.unlock() }
+        return cache.values
+            .filter { $0.deletedAt != nil }
+            .sorted { ($0.deletedAt ?? .distantPast) > ($1.deletedAt ?? .distantPast) }
+    }
+
+    /// 移入回收站（30 天内可恢复）—— 不是真删
+    func moveToTrash(_ batch: BKBatch) {
+        var b = batch
+        b.deletedAt = Date()
+        save(b)
+    }
+
+    /// 从回收站恢复
+    func restore(_ batch: BKBatch) {
+        var b = batch
+        b.deletedAt = nil
+        save(b)
+    }
+
+    /// 清掉回收站里超过保留期的批（bk-clip 同款：30 天）
+    func purgeExpiredTrash() {
+        let deadline = Date().addingTimeInterval(-Double(BKConfig.Draft.trashKeepDays) * 86400)
+        for b in trashBatches() where (b.deletedAt ?? .distantPast) < deadline {
+            delete(b)
+            BKLog.shared.i("回收站过期清理：「\(b.displayTitle)」")
+        }
     }
 
     func batch(id: UUID) -> BKBatch? {
@@ -68,7 +101,8 @@ final class BKDraftStore {
         try? data.write(to: fileURL, options: .atomic)
     }
 
-    /// 一次导入 = 建一批，每条先记下 localID + 名字，刀口为空（进编辑页才检测）
+    /// 一次导入 = 建一批。批标题默认取第一条素材名（bk-clip 草稿页同款），
+    /// 多条时追加「等 N 条」；后面可重命名
     func makeBatch(localIDs: [String]) -> BKBatch {
         let now = Date()
         let items = localIDs.map { id -> BKClipItem in
@@ -80,10 +114,13 @@ final class BKDraftStore {
                        keepBase: nil,
                        thresholdDb: -35,
                        autoThresholdDb: nil,
-                       everEdited: false)
+                       everEdited: false,
+                       redCount: nil)
         }
-        var b = BKBatch(id: UUID(), title: "", items: items, createdAt: now, lastEditedAt: now)
-        b.title = b.displayTitle
+        var b = BKBatch(id: UUID(), title: "", items: items, createdAt: now, lastEditedAt: now, deletedAt: nil)
+        if let first = items.first {
+            b.title = items.count > 1 ? "\(first.assetName) 等\(items.count)条" : first.assetName
+        }
         return b
     }
 }
