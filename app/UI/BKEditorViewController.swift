@@ -396,7 +396,7 @@ final class BKEditorViewController: UIViewController {
     }
 
     @objc private func undoTapped() {
-        guard let prev = undoStack.popLast else { return }
+        guard let prev = undoStack.popLast() else { return }
         cuts = prev
         marks = BKTimeline.build(duration: total, cuts: cuts)
         refreshTrack()

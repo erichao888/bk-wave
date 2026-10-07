@@ -18,7 +18,7 @@ final class BKRootViewController: UICollectionViewController {
     init() {
         let layout = UICollectionViewFlowLayout()
         layout.minimumLineSpacing = 8
-        layout.minimumIntersectingItemSpacing = 8
+        layout.minimumInteritemSpacing = 8
         layout.sectionInset = UIEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
         super.init(collectionViewLayout: layout)
     }
@@ -131,7 +131,7 @@ final class BKRootViewController: UICollectionViewController {
     private func itemSize() -> CGSize {
         let layout = collectionView.collectionViewLayout as? UICollectionViewFlowLayout
         let inset = layout?.sectionInset ?? .zero
-        let gap = layout?.minimumIntersectingItemSpacing ?? 8
+        let gap = layout?.minimumInteritemSpacing ?? 8
         let cols: CGFloat = 3
         let w = (collectionView.bounds.width - inset.left - inset.right - gap * (cols - 1)) / cols
         let h = w * 4 / 3   // 9:16 偏竖，给点余量用 4:3 占位框
