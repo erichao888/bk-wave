@@ -1,0 +1,8 @@
+# XcodeGen 生成，不入库（CI 里 xcodegen generate 重建）
+bkWave.xcodeproj/
+
+# macOS
+.DS_Store
+
+# 本地导出产物（导出走相册，文件不进 git）
+Exports/

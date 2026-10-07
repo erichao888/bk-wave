@@ -1,0 +1,102 @@
+# bk波剪 · XcodeGen 工程定义
+#
+# 独立的纯波形剪辑 App（erichao888/bk-wave）。
+# 范围：选视频 → 看波形 → 剪气口 → 导出。去掉综合剪辑页的多轨/复制/变速。
+#
+# 生成方式（在 Mac 上执行一次）：
+#   brew install xcodegen
+#   cd bk-wave && xcodegen generate
+#   open bkWave.xcodeproj
+#
+# 三条铁律（和 bk-clip 一致）：
+#   1. PRODUCT_BUNDLE_IDENTIFIER 必须和 release 一致（本工程没有 release 目录，记住 com.benka.bkwave）
+#   2. PRODUCT_NAME 必须纯 ASCII（bkWave）—— 中文包名会让爱思重签报错误码 45
+#   3. 加新 .swift 文件不需要改这里 —— sources 是整个 app/ 递归的
+
+name: bkWave
+
+options:
+  bundleIdPrefix: com.benka
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    ENABLE_BITCODE: "NO"
+    TARGETED_DEVICE_FAMILY: "1"
+    CLANG_ENABLE_MODULES: "YES"
+
+targets:
+  bkWave:
+    type: application
+    platform: iOS
+    deploymentTarget: "15.0"
+
+    sources:
+      # app/ 整棵递归：Core / UI / App 分层都在里面
+      - app
+
+    # App 图标：resources 必须显式声明，sources 的递归对 .xcassets 不生效
+    resources:
+      - path: app/Assets.xcassets
+
+    # 显式声明 scheme，避免云端无人登录时 xcodebuild -scheme 找不到
+    schemes:
+      bkWave:
+        build:
+          targets:
+            bkWave: all
+        run:
+          config: Release
+
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.benka.bkwave
+        # 必须是纯英文！爱思用个人 Apple ID 重签名时，包内路径出现中文会报「签名失败，错误码 45」
+        PRODUCT_NAME: bkWave
+        CFBundleName: bkWave
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        CODE_SIGN_STYLE: Automatic
+
+    info:
+      # path 必填：XcodeGen 按它生成 Info.plist 并自动设好 INFOPLIST_FILE
+      path: app/Info.plist
+      properties:
+        CFBundleDisplayName: "bk波剪"
+        # 版本号走变量：物理 plist 一旦存在，settings 里的 MARKETING_VERSION 就不生效
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        CFBundleName: bkWave
+        # 把编译时的 git commit 烙进包里，排障用
+        BKCommitSHA: "$(GIT_SHA)"
+
+        # ---- App 图标 ----
+        CFBundleIcons:
+          CFBundlePrimaryIcon:
+            CFBundleIconName: AppIcon
+        CFBundleIconName: AppIcon
+
+        # ---- 权限文案 ----
+        NSPhotoLibraryUsageDescription: "bk波剪需要读取你的相册，用来导入要剪辑的视频"
+        NSPhotoLibraryAddUsageDescription: "bk波剪需要把剪辑完成的视频保存到相册"
+        NSPhotoLibraryPreventAutomaticLimitedAccessAlert: YES
+
+        # ---- 界面 ----
+        # 锁竖屏
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UIRequiresFullScreen: YES
+        # 配色焊死深色，不跟系统深浅模式
+        UIUserInterfaceStyle: Dark
+        UIStatusBarStyle: UIStatusBarStyleDefault
+        UILaunchScreen:
+          UIColorName: ""
+
+        # ---- 文件分享：没有 Xcode 时，连 iTunes/访达能直接拖出 bk.log 排障 ----
+        UIFileSharingEnabled: YES
+
+        # 个人自用 App，不走 App Store 的加密合规申报
+        ITSAppUsesNonExemptEncryption: NO

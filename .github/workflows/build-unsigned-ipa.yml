@@ -1,0 +1,108 @@
+name: 打包未签名 IPA
+
+# 产出「未签名 ipa」—— 还差一道签名（爱思助手 + 个人 Apple ID）。
+# 详见发版流程：推 tag vX.Y.Z → 本工作流打包 → 爱思重签安装。
+#
+# ⚠️ 目录约定：本文件必须位于仓库根目录下的 .github/workflows/。
+#    即「拿 bk-wave 这个文件夹的内容当仓库根目录」，project.yml 与 .github/ 自然对上。
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 打印环境
+        run: |
+          xcodebuild -version
+          sw_vers
+          which brew
+
+      - name: 安装 XcodeGen
+        run: |
+          set -o pipefail
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen 2>&1 | tail -15
+          xcodegen --version
+
+      - name: 生成 Xcode 工程
+        run: |
+          # 统一转 LF：仓库文本文件是 Windows 提交的 CRLF，在 macOS runner 上
+          # 残留的 \r 会让 PRODUCT_NAME 误判成非 ASCII
+          tr -d '\r' < project.yml > project.yml.lf && mv -f project.yml.lf project.yml
+
+          xcodegen generate --spec project.yml && {
+            echo "=== 原生 YAML 生成成功，工程里的 scheme： ==="
+            xcodebuild -list -project bkWave.xcodeproj || true
+            exit 0
+          }
+          echo "::warning::原生 YAML 生成失败"
+
+      - name: 检查 PRODUCT_NAME 必须是纯 ASCII
+        run: |
+          NAME=$(grep -m1 '^[[:space:]]*PRODUCT_NAME:' project.yml | grep -v '^[[:space:]]*#' | awk '{print $2}' | tr -d '\r')
+          echo "PRODUCT_NAME = [$NAME]"
+          if [ -z "$NAME" ]; then
+            echo "::error::没从 project.yml 里取到 PRODUCT_NAME"
+            exit 1
+          fi
+          if [ "$NAME" != "bkWave" ]; then
+            echo "::error::PRODUCT_NAME 必须是 ASCII 的 bkWave，中文包名会导致爱思签名报错误码 45"
+            exit 1
+          fi
+
+      - name: 编译（不签名）
+        run: |
+          set -o pipefail
+          SHA=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
+          echo "GIT_SHA = $SHA"
+          xcodebuild \
+            -project bkWave.xcodeproj \
+            -scheme bkWave \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            GIT_SHA="$SHA" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            SWIFT_COMPILATION_MODE=wholemodule \
+            2>&1 | tee xcodebuild.log | grep -E "error|warning: |BUILD|note: " | tail -60
+          status=${PIPESTATUS[0]}
+          echo "xcodebuild 退出码 $status"
+          [ "$status" = "0" ] || {
+            echo "====== 失败日志最后 80 行 ======"
+            tail -80 xcodebuild.log
+            exit 1
+          }
+
+      - name: 打包 ipa
+        run: |
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -1)
+          if [ -z "$APP" ]; then echo "::error::没找到编译产物 .app"; exit 1; fi
+          echo "产物：$APP"
+          du -sh "$APP"
+          rm -rf Payload && mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry bkWave-unsigned.ipa Payload
+          ls -lh bkWave-unsigned.ipa
+          unzip -l bkWave-unsigned.ipa | head -8
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: bkWave-unsigned-ipa
+          path: bkWave-unsigned.ipa
+          retention-days: 30
