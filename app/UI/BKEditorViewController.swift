@@ -61,9 +61,9 @@ final class BKEditorViewController: UIViewController {
 
     /// 当前素材的相册 localID（从草稿批里取，加载后才有值）
     private var localID: String = ""
-    /// 所属草稿批 + 批内序号；编辑器必须挂在某个批里工作
+    /// 所属草稿批 + 批内序号；切素材时会被改，所以是 var
     private let batchID: UUID?
-    private let itemIndex: Int
+    private var itemIndex: Int
     private var asset: AVAsset?
     private var envelope: BKEnvelope?
     private var total: Double = 0
@@ -296,7 +296,7 @@ final class BKEditorViewController: UIViewController {
         trackContainer.layer.cornerRadius = BKTheme.Radius.card
         trackContainer.clipsToBounds = true
         trackView.delegate = self
-        trackView.allowsSiblingSwitch = false   // 单素材，禁用越界换片
+        trackView.allowsSiblingSwitch = true   // 拖到头/尾再继续拖可切上/下一条素材
         trackContainer.addSubview(trackView)
         trackView.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
@@ -1108,6 +1108,26 @@ final class BKEditorViewController: UIViewController {
 
     // MARK: - 草稿持久化
 
+    /// 当前所属批（磁盘上的最新状态）
+    private var currentBatch: BKBatch? {
+        guard let bid = batchID else { return nil }
+        return BKDraftStore.shared.batch(id: bid)
+    }
+
+    /// 轨道拖拽换素材（bk剪辑早期那套「拖过头切上/下一条」）：
+    /// 停播 → 手上这条先存回草稿 → 清撤销栈（跨素材撤销没意义）→ 载入新的一条
+    private func switchToItem(_ newIndex: Int) {
+        guard let b = currentBatch, b.items.indices.contains(newIndex) else { return }
+        stopPlayback()
+        persistItem()
+        undoStack.removeAll()
+        redoStack.removeAll()
+        itemIndex = newIndex
+        localID = b.items[newIndex].localID
+        loadMaterial()
+        BKLog.shared.i("轨道拖拽：切到第 \(newIndex + 1)/\(b.items.count) 条")
+    }
+
     /// 把当前编辑态写回所属草稿批（整批 JSON 落盘）
     private func persistItem() {
         guard let bid = batchID else { return }
@@ -1236,11 +1256,19 @@ extension BKEditorViewController: BKTrackViewDelegate {
     }
 
     func trackDidPullBeyondHead(_ view: BKTrackView) {
-        // 单素材：无上一条，忽略
+        guard let b = currentBatch, b.items.count > 1, itemIndex > 0 else {
+            statusLabel.text = "已经是第一条了"
+            return
+        }
+        switchToItem(itemIndex - 1)
     }
 
     func trackDidPullBeyondTail(_ view: BKTrackView) {
-        // 单素材：无下一条，忽略
+        guard let b = currentBatch, b.items.count > 1, itemIndex < b.items.count - 1 else {
+            statusLabel.text = "已经是最后一条了"
+            return
+        }
+        switchToItem(itemIndex + 1)
     }
 
     // MARK: 拖红区边缘调气口大小

@@ -37,12 +37,14 @@ final class BKDraftStore {
         try? data.write(to: fileURL, options: .atomic)
     }
 
-    /// 所有批，按最近编辑时间倒序（最新的在最前）。**不含回收站里的**
+    /// 所有批，**按挑选（导入）顺序**：先挑的在上，后挑的在下。
+    /// ⚠️ 不能用 lastEditedAt 排 —— 那样「先导入但刚被编辑过」的批会反超到后面，
+    ///    列表顺序看起来就乱了（皓哥 2026-10-08 指出）。不含回收站里的。
     func allBatches() -> [BKBatch] {
         lock.lock(); defer { lock.unlock() }
         return cache.values
             .filter { $0.deletedAt == nil }
-            .sorted { $0.lastEditedAt > $1.lastEditedAt }
+            .sorted { $0.createdAt < $1.createdAt }
     }
 
     /// 回收站里的批（deletedAt 非空），最近删的在前
