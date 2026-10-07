@@ -22,8 +22,9 @@ final class BKExportPanelViewController: UIViewController {
     // MARK: - 数据
 
     private let asset: AVAsset
-    private let duration: Double
-    private let cuts: [(Double, Double)]
+    /// 最终保留段（源时间，绝对坐标）。编辑器在折叠态直接传 keepBase，
+    /// 未折叠态传 cuts 派生出的保留段。面板不再自己算。
+    private let keeps: [(Double, Double)]
     private let baseTitle: String
 
     private var resolution: BKConfig.Resolution = .same
@@ -47,10 +48,9 @@ final class BKExportPanelViewController: UIViewController {
 
     // MARK: - 初始化
 
-    init(asset: AVAsset, duration: Double, cuts: [(Double, Double)], title: String) {
+    init(asset: AVAsset, keeps: [(Double, Double)], title: String) {
         self.asset = asset
-        self.duration = duration
-        self.cuts = cuts
+        self.keeps = keeps
         self.baseTitle = title.isEmpty ? "clip" : title
         super.init(nibName: nil, bundle: nil)
     }
@@ -215,11 +215,14 @@ final class BKExportPanelViewController: UIViewController {
     }
 
     private func updateSummary() {
-        let keeps = BKDetector.keptSegments(cuts, totalSec: duration)
         let keepTotal = keeps.reduce(0.0) { $0 + max(0, $1.1 - $1.0) }
+        if keeps.isEmpty {
+            summaryLabel.text = "没有可保留的片段，先少删一点再导出"
+            return
+        }
         summaryLabel.text = String(format:
-            "保留 %d 段 · 原片 %.1fs → 成品约 %.1fs\n规格：%@",
-            keeps.count, duration, keepTotal,
+            "保留 %d 段 · 成品约 %.1fs\n规格：%@",
+            keeps.count, keepTotal,
             BKConfig.ExportSpec(resolution: resolution, frameRate: frameRate).summary)
     }
 
@@ -227,7 +230,6 @@ final class BKExportPanelViewController: UIViewController {
 
     @objc private func exportTapped() {
         guard !exporting else { return }
-        let keeps = BKDetector.keptSegments(cuts, totalSec: duration)
         guard !keeps.isEmpty else {
             summaryLabel.text = "没有可保留的片段，先少删一点再导出"
             return
@@ -329,6 +331,12 @@ final class BKExportPanelViewController: UIViewController {
             // 完成后点「完成」即关闭
             exportButton.removeTarget(nil, action: nil, for: .allEvents)
             exportButton.addTarget(self, action: #selector(closeTapped), for: .touchUpInside)
+        } else {
+            // 失败也要给个弹窗，不然「没反应」容易被当成卡死
+            let alert = UIAlertController(title: "导出未完成", message: message,
+                                          preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "知道了", style: .cancel))
+            present(alert, animated: true)
         }
     }
 

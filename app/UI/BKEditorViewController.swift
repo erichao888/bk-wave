@@ -48,11 +48,12 @@ final class BKEditorViewController: UIViewController {
         case joint
     }
 
-    /// 撤销栈快照：cuts + 显示接缝。
+    /// 撤销栈快照：cuts + 显示接缝 + 折叠态。
     /// 阈值重检也会先把旧状态压栈，手调过的刀口能靠撤销找回来
     private struct EditState {
         var cuts: [(Double, Double)]
         var splits: [Double]
+        var keepBase: [(Double, Double)]?
     }
 
     // MARK: - 数据
@@ -68,6 +69,11 @@ final class BKEditorViewController: UIViewController {
     private var marks: [BKMark] = []
     /// 纯显示接缝（✂ 加的分割线，不改数据，ck Q3 拍板）
     private var splits: [Double] = []
+    /// 素材原始时长（检测/导出永远以它为基准，不被折叠态改动）
+    private var assetTotal: Double = 0
+    /// 折叠后的「保留段」（源时间）。nil = 未折叠（红区还在，cuts 是删除区间）。
+    /// 非 nil = 已点✗✗，主轨只剩这些绿段，total 已被重映射成折叠后时长。
+    private var keepBase: [(Double, Double)]? = nil
 
     /// 当前阈值 dB。滑块拖动即按它重检
     private var thresholdDb: Double = -35
@@ -226,14 +232,18 @@ final class BKEditorViewController: UIViewController {
             case .idle:
                 break
             case .straight:
-                self.syncPlayhead(to: sec)
+                // 原片 player 报的是原片时间，折叠态要反查回显示轴
+                self.syncPlayhead(to: self.displayTime(of: sec))
             case .joint:
                 guard let j = self.jointBuild else { return }
                 if sec >= j.total - 0.02 {
                     self.stopPlayback()
                 } else {
-                    // 成品时间 → 反查原片时间，指针在原片轴上连贯前进，遇红区「跨」过去
-                    self.syncPlayhead(to: BKCompositionBuilder.sourceTime(j, outputTime: sec))
+                    // 折叠态：主轨就是成品时间轴，指针直接落在成品时间上；
+                    // 未折叠：成品时间 → 反查原片时间，指针在原片轴上连贯前进
+                    let pointerT = (self.keepBase != nil) ? sec
+                        : BKCompositionBuilder.sourceTime(j, outputTime: sec)
+                    self.syncPlayhead(to: pointerT)
                 }
             }
         }
@@ -541,7 +551,9 @@ final class BKEditorViewController: UIViewController {
                     switch result {
                     case .success(let env):
                         self.envelope = env
+                        self.assetTotal = env.duration
                         self.total = env.duration
+                        self.keepBase = nil
                         self.lastTime = 0
                         self.timeLabel.text = "\(self.formatClock(0)) / \(self.formatClock(self.total))"
                         self.setControlsEnabled(true)
@@ -560,11 +572,11 @@ final class BKEditorViewController: UIViewController {
     /// recordUndo=true 时先把当前刀口压进撤销栈 —— 阈值重检会整体重算 cuts，
     /// 手动调过的边界要能靠撤销找回来
     private func runDetection(override: Double?, recordUndo: Bool = false) {
-        guard let env = envelope, total > 0 else { return }
+        guard let env = envelope, assetTotal > 0 else { return }
         statusLabel.text = "正在检测气口…"
         spinner.startAnimating()
 
-        let dur = total
+        let dur = assetTotal
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let outcome = BKDetector.detect(envelope: env,
                                             totalDuration: dur,
@@ -573,6 +585,9 @@ final class BKEditorViewController: UIViewController {
                 guard let self = self else { return }
                 self.spinner.stopAnimating()
                 if recordUndo { self.pushUndo() }
+                // 重新检测 = 退折叠，回到原始时间轴
+                self.keepBase = nil
+                self.total = self.assetTotal
                 self.cuts = outcome.cuts
                 self.marks = BKTimeline.build(duration: dur, cuts: self.cuts)
                 self.thresholdDb = outcome.info.thresholdDb
@@ -606,23 +621,50 @@ final class BKEditorViewController: UIViewController {
 
     /// 轨道 + 概览条一起刷新。分开刷迟早会出现「轨道已经切了，概览条还画着旧的」
     private func refreshTrack() {
-        let pieces = BKTimeline.pieces(duration: total, cuts: cuts, splits: splits)
-        trackView.setContent(envelope: envelope, pieces: pieces, splits: splits,
-                             duration: total, thresholdDb: thresholdDb, redFolded: false)
-        overviewBar.setContent(envelope: envelope, pieces: pieces, duration: total,
-                               viewport: trackView.viewport)
+        if let base = keepBase {
+            // 折叠态：轨道画成「成品时间轴」，靠 foldMap 把显示坐标映射回原片包络
+            var acc = 0.0
+            var map: [(out: Double, src: Double, dur: Double)] = []
+            var foldedPieces: [BKMark] = []
+            for (s, e) in base {
+                let len = max(0, e - s)
+                map.append((out: acc, src: s, dur: len))
+                foldedPieces.append(BKMark(start: acc, end: acc + len, kind: .keep))
+                // 段间插零长度标记当分割线（redFolded 时画缝，保留「可单独编辑」的视觉）
+                foldedPieces.append(BKMark(start: acc + len, end: acc + len, kind: .keep))
+                acc += len
+            }
+            if foldedPieces.count > 1 { foldedPieces.removeLast() }
+            trackView.setContent(envelope: envelope, pieces: foldedPieces, splits: [],
+                                 duration: total, thresholdDb: thresholdDb,
+                                 foldMap: map, redFolded: true)
+            overviewBar.setContent(envelope: envelope, pieces: foldedPieces, duration: total,
+                                   viewport: trackView.viewport)
+        } else {
+            let pieces = BKTimeline.pieces(duration: total, cuts: cuts, splits: splits)
+            trackView.setContent(envelope: envelope, pieces: pieces, splits: splits,
+                                 duration: total, thresholdDb: thresholdDb, redFolded: false)
+            overviewBar.setContent(envelope: envelope, pieces: pieces, duration: total,
+                                   viewport: trackView.viewport)
+        }
     }
 
     private func updateInfo() {
+        if let base = keepBase {
+            let outDur = base.reduce(0.0) { $0 + max(0, $1.1 - $1.0) }
+            infoLabel.text = String(format: "原 %@ · 剪后 %@ · 已折叠红区 · 保留 %d 段",
+                                    formatClock(assetTotal), formatClock(outDur), base.count)
+            return
+        }
         let removed = cuts.reduce(0.0) { $0 + ($1.1 - $1.0) }
-        let outDur = max(0, total - removed)
+        let outDur = max(0, assetTotal - removed)
         if cuts.isEmpty {
             infoLabel.text = String(format: "原 %@ · 剪后 %@ · 还没有刀口",
-                                    formatClock(total), formatClock(outDur))
+                                    formatClock(assetTotal), formatClock(outDur))
         } else {
-            let ratio = total > 0 ? removed / total : 0
+            let ratio = assetTotal > 0 ? removed / assetTotal : 0
             infoLabel.text = String(format: "原 %@ · 剪后 %@ · %d 刀 · 删 %.1fs（%.1f%%）",
-                                    formatClock(total), formatClock(outDur),
+                                    formatClock(assetTotal), formatClock(outDur),
                                     cuts.count, removed, ratio * 100)
         }
     }
@@ -630,7 +672,7 @@ final class BKEditorViewController: UIViewController {
     // MARK: - 撤销 / 重做
 
     private func pushUndo() {
-        undoStack.append(EditState(cuts: cuts, splits: splits))
+        undoStack.append(EditState(cuts: cuts, splits: splits, keepBase: keepBase))
         if undoStack.count > BKConfig.Draft.undoLimit { undoStack.removeFirst() }
         redoStack.removeAll()
         updateUndoButtons()
@@ -639,7 +681,16 @@ final class BKEditorViewController: UIViewController {
     private func apply(_ s: EditState) {
         cuts = s.cuts
         splits = s.splits
-        marks = BKTimeline.build(duration: total, cuts: cuts)
+        keepBase = s.keepBase
+        if let base = keepBase {
+            // 还原折叠态：total 重映射成折叠后时长，红区已不在
+            total = base.reduce(0.0) { $0 + max(0, $1.1 - $1.0) }
+            marks = []
+        } else {
+            // 还原未折叠态：回到原始时间轴
+            total = assetTotal
+            marks = BKTimeline.build(duration: assetTotal, cuts: cuts)
+        }
         refreshTrack()
         updateInfo()
     }
@@ -674,6 +725,10 @@ final class BKEditorViewController: UIViewController {
     /// ✂ 把指针所在的地方切开。**切开 ≠ 删除**：切口不进 cuts，
     /// 导出时长纹丝不动。作用是把一段划成两段，好让你单独处理其中一半
     @objc private func cutTapped() {
+        guard keepBase == nil else {
+            statusLabel.text = "已折叠，重检后可再编辑"
+            return
+        }
         let t = min(max(lastTime, 0), total)
         guard t > 0.05, t < total - 0.05 else {
             statusLabel.text = "指针太靠两头了，这里切不出东西"
@@ -690,33 +745,52 @@ final class BKEditorViewController: UIViewController {
         refreshTrack()
     }
 
-    /// ✗✗ 清空全部红区（单素材版语义；ck 里它是「删红折叠」，本 App 无第二阶段）
+    /// ✗✗ = 折叠红区：把当前红区（删除区间）对应的视频段真正从主轨去掉，
+    /// 只留绿区拼成新主轨。ck v2.0 的「删红折叠」同款语义。
+    /// 不是「清空红区」—— 那等于什么都不删（旧实现的反向 bug）。
     @objc private func deleteRedTapped() {
+        guard keepBase == nil else {
+            statusLabel.text = "已经折叠过红区了，拖动阈值重检可还原"
+            return
+        }
         guard !cuts.isEmpty else {
-            statusLabel.text = "当前没有红区可清"
+            statusLabel.text = "当前没有红区可删"
             return
         }
         pushUndo()
-        let n = cuts.count
-        cuts = []
-        marks = BKTimeline.build(duration: total, cuts: cuts)
+        let keeps = BKDetector.keptSegments(cuts, totalSec: assetTotal)
+        keepBase = keeps
+        let folded = keeps.reduce(0.0) { $0 + max(0, $1.1 - $1.0) }
+        total = folded
+        marks = []
+        splits = []
         refreshTrack()
         updateInfo()
-        statusLabel.text = String(format: "已清空 %d 段红区 · 撤销可恢复", n)
+        statusLabel.text = String(format: "已删除 %d 处红区，主轨仅剩保留段（%d 段 · 剪后 %.1fs）",
+                                  cuts.count, keeps.count, folded)
+        // 折叠后红区已并入主轨之外，删除区间无需再持有
+        cuts = []
     }
 
-    /// 点段 toggle 绿↔红：「只能删红区、绿区想删先点成红」
+    /// 点段 toggle 绿↔红。命中用 `pieces`（含 ✂ 分割线），
+    /// 这样「两道分割线之间的子段」能单独转红，而不是整段一起翻。
+    /// 折叠态下主轨已无红区，点选无意义。
     private func togglePiece(at time: Double) {
-        guard let idx = marks.firstIndex(where: { time >= $0.start - 1e-9 && time <= $0.end + 1e-9 })
+        guard keepBase == nil else {
+            statusLabel.text = "已折叠，拖动阈值重检后可再编辑"
+            return
+        }
+        let ps = BKTimeline.pieces(duration: assetTotal, cuts: cuts, splits: splits)
+        guard let idx = ps.firstIndex(where: { time >= $0.start - 1e-9 && time <= $0.end + 1e-9 })
         else {
             statusLabel.text = "指针这儿没有片段"
             return
         }
-        let piece = marks[idx]
+        let piece = ps[idx]
         pushUndo()
-        let next = BKTimeline.toggle(marks: marks, at: idx)
+        let next = BKTimeline.toggle(marks: ps, at: idx)
         cuts = cutsFromMarks(next)
-        marks = BKTimeline.build(duration: total, cuts: cuts)
+        marks = BKTimeline.build(duration: assetTotal, cuts: cuts)
         refreshTrack()
         updateInfo()
         if piece.kind == .cut {
@@ -809,6 +883,10 @@ final class BKEditorViewController: UIViewController {
         if playMode == .straight { stopPlayback(); return }
         stopPlayback()
         guard originalItem != nil else { return }
+        // 折叠态：显示时间 → 原片时间，从指针处起播
+        let src = sourceTime(of: lastTime)
+        player.seek(to: CMTime(seconds: src, preferredTimescale: 600),
+                    toleranceBefore: .zero, toleranceAfter: .zero)
         player.play()
         playMode = .straight
         updatePlayIcons()
@@ -820,13 +898,13 @@ final class BKEditorViewController: UIViewController {
         stopPlayback()
         guard let a = asset, total > 0 else { return }
 
-        let keeps = BKDetector.keptSegments(cuts, totalSec: total)
+        let keeps = keepBase ?? BKDetector.keptSegments(cuts, totalSec: assetTotal)
         guard let built = BKCompositionBuilder.make(asset: a, keeps: keeps) else {
             statusLabel.text = "没有可保留的片段，先少删一点"
             return
         }
         // 指针在绿区就从指针处播，指针在红区就跳下一个绿区
-        guard let startSrc = startKeptTime(for: lastTime, keeps: keeps) else {
+        guard let startSrc = startKeptTime(for: sourceTime(of: lastTime), keeps: keeps) else {
             statusLabel.text = "指针后面没有可播的片段了"
             return
         }
@@ -840,8 +918,9 @@ final class BKEditorViewController: UIViewController {
         player.seek(to: CMTime(seconds: startOut, preferredTimescale: 600),
                     toleranceBefore: .zero, toleranceAfter: .zero)
         // 指针跟着挪到对应位置，跳转是瞬间的。
-        // ⚠️ 这里传的是**原片**时间 —— 主轨道画的是原片时间轴
-        syncPlayhead(to: startSrc)
+        // 未折叠：主轨画原片轴，指针落原片时间 startSrc；
+        // 已折叠：主轨就是成品轴，指针落成品时间 startOut
+        syncPlayhead(to: (keepBase != nil) ? startOut : startSrc)
 
         player.play()
         playMode = .joint
@@ -897,15 +976,16 @@ final class BKEditorViewController: UIViewController {
     // MARK: - 导出 / 返回
 
     @objc private func exportTapped() {
-        guard let asset = asset, total > 0 else {
+        guard let asset = asset, assetTotal > 0 else {
             statusLabel.text = "素材未就绪，无法导出"
             return
         }
         stopPlayback()
         let title = (BKVideoLibrary.assetName(localID: localID) as NSString)
             .deletingPathExtension
-        let panel = BKExportPanelViewController(asset: asset, duration: total,
-                                               cuts: cuts, title: title)
+        // 折叠态直接吃 keepBase；未折叠吃 cuts 派生出的保留段（源时间，绝对坐标）
+        let keeps = keepBase ?? BKDetector.keptSegments(cuts, totalSec: assetTotal)
+        let panel = BKExportPanelViewController(asset: asset, keeps: keeps, title: title)
         let nav = UINavigationController(rootViewController: panel)
         present(nav, animated: true)
     }
@@ -941,6 +1021,36 @@ final class BKEditorViewController: UIViewController {
 
     // MARK: - 工具
 
+    // MARK: - 折叠态时间映射
+
+    /// 显示时间（折叠后成品时间轴）→ 原片时间。未折叠时恒等。
+    /// 播放 / 手动 seek 都要拿它去定位原片 player。
+    private func sourceTime(of displayT: Double) -> Double {
+        guard let base = keepBase, !base.isEmpty else { return displayT }
+        var acc = 0.0
+        for (s, e) in base {
+            let len = max(0, e - s)
+            if displayT <= acc + len + 1e-9 { return s + max(0, displayT - acc) }
+            acc += len
+        }
+        return base.last?.1 ?? 0
+    }
+
+    /// 原片时间 → 显示时间（折叠后成品时间轴）。未折叠时恒等。
+    /// 播放回调里 AVPlayer 报的是原片时间，要反查回显示轴才对得上指针。
+    private func displayTime(of srcT: Double) -> Double {
+        guard let base = keepBase, !base.isEmpty else { return srcT }
+        var acc = 0.0
+        for (s, e) in base {
+            let len = max(0, e - s)
+            if srcT >= s - 1e-9 && srcT <= e + 1e-9 {
+                return acc + max(0, srcT - s)
+            }
+            acc += len
+        }
+        return acc
+    }
+
     /// mm:ss。时间码用这个：小数点后一位在剪辑场景里是噪音
     private func formatClock(_ t: Double) -> String {
         let s = max(0, t)
@@ -958,7 +1068,7 @@ extension BKEditorViewController: BKTrackViewDelegate {
         let t = min(max(time, 0), total)
         // 手动找位置一律静音：播放中先停，再 seek（rate==0 的 seek 天然不出声）
         if playMode != .idle { stopPlayback() }
-        seekOriginal(to: t)
+        seekOriginal(to: sourceTime(of: t))
         lastTime = t
         timeLabel.text = "\(formatClock(t)) / \(formatClock(total))"
         overviewBar.setViewport(view.viewport)
@@ -994,10 +1104,11 @@ extension BKEditorViewController: BKTrackViewDelegate {
     }
 
     func track(_ view: BKTrackView, didDragRedEdgeNear near: Double, to newTime: Double) {
+        guard keepBase == nil else { return }
         guard let next = BKTimeline.moveRedEdge(cuts: cuts, near: near, to: newTime,
-                                                duration: total) else { return }
+                                                duration: assetTotal) else { return }
         cuts = next
-        marks = BKTimeline.build(duration: total, cuts: cuts)
+        marks = BKTimeline.build(duration: assetTotal, cuts: cuts)
         refreshTrack()
         updateInfo()
     }
@@ -1021,7 +1132,7 @@ extension BKEditorViewController: BKOverviewBarDelegate {
         if playMode != .idle { stopPlayback() }
         trackView.setPointerTime(t)
         overviewBar.setViewport(trackView.viewport)
-        seekOriginal(to: t)
+        seekOriginal(to: sourceTime(of: t))
         lastTime = t
         timeLabel.text = "\(formatClock(t)) / \(formatClock(total))"
     }
