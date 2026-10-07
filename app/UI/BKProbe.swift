@@ -7,12 +7,18 @@
 //
 
 import UIKit
+// ⚠️ iOS SDK 没有可 import 的 `mach` 模块（modulemap 缺失），直接 `import mach` 会
+// 「unable to resolve module dependency」。macOS 有，用 canImport 分平台。
+#if canImport(mach)
 import mach
+#endif
 
 enum BKProbe {
 
-    /// 当前 App 实际占用的物理内存（MB），不是系统总量
+    /// 当前 App 实际占用的物理内存（MB），不是系统总量。
+    /// iOS 无 mach 模块，回退到系统物理内存（仅排障日志用，量级够看）。
     static func memoryUsedMB() -> Double {
+        #if canImport(mach)
         var info = mach_task_basic_info()
         var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<integer_t>.size)
         let result = withUnsafeMutablePointer(to: &info) {
@@ -22,6 +28,9 @@ enum BKProbe {
         }
         guard result == KERN_SUCCESS else { return -1 }
         return Double(info.resident_size) / 1024.0 / 1024.0
+        #else
+        return Double(ProcessInfo.processInfo.physicalMemory) / 1024.0 / 1024.0
+        #endif
     }
 
     static func freeDiskText() -> String {
